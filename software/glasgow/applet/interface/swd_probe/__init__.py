@@ -7,16 +7,18 @@
 # instructed in the comment there.
 
 from collections.abc import AsyncIterator
+from typing import Literal
 import sys
 import argparse
-import logging
 import struct
 
 from amaranth import *
 from amaranth.lib import enum, data, wiring, stream
 from amaranth.lib.wiring import In, Out
 
+from glasgow.support import logging
 from glasgow.support.bits import bits
+from glasgow.support.progress import Progress
 from glasgow.arch.arm.swj import *
 from glasgow.arch.arm.dap import *
 from glasgow.database.jedec import jedec_mfg_name_from_bank_num
@@ -35,9 +37,25 @@ class SWDProbeException(GlasgowAppletError):
         Timeout = "timeout" # too many retries for a WAIT response
         Other   = "other"   # unspecified
 
-    def __init__(self, message, *, kind: Kind = Kind.Other):
+    def __init__(self, kind: Kind = Kind.Other, *, address: int | None = None,
+                 message: str | None = None):
         self.kind = kind
-        super().__init__(message)
+        self.address = address
+        self.message = message
+
+    def __str__(self):
+        match self.kind:
+            case SWDProbeException.Kind.Error:
+                message = "communication error"
+            case SWDProbeException.Kind.Fault:
+                message = "transaction fault"
+            case SWDProbeException.Kind.Timeout:
+                message = "wait timeout"
+            case _:
+                message = self.message or "unknown error"
+        if self.address is not None:
+            message += f" (at address {self.address:#10x}"
+        return message
 
 
 class SWDCommand(data.Struct):
@@ -85,6 +103,7 @@ class SWDProbeComponent(wiring.Component):
         m.d.comb += ctrl.divisor.eq(self.divisor)
         m.d.comb += ctrl.timeout.eq(self.timeout)
 
+        w_pending = Signal()
         with m.FSM(name="i_fsm"):
             with m.State("Command"):
                 i_command = SWDCommand(self.i_stream.payload)
@@ -101,9 +120,14 @@ class SWDProbeComponent(wiring.Component):
                         m.next = "Data"
                     with m.Elif((i_command.cmd == swd.Command.Transfer) &
                             (i_command.arg.transfer.r_nw == 0)):
+                        m.d.sync += w_pending.eq(1)
                         m.next = "Data"
                     with m.Else():
                         m.next = "Execute"
+                with m.Else():
+                    m.d.sync += w_pending.eq(0)
+                    with m.If(w_pending):
+                        m.next = "Flush"
 
             with m.State("Data"):
                 i_count = Signal(range(4))
@@ -113,6 +137,20 @@ class SWDProbeComponent(wiring.Component):
                     m.d.sync += i_count.eq(i_count + 1)
                     with m.If(i_count == 3):
                         m.next = "Execute"
+
+            with m.State("Flush"):
+                # ADIv5.2 §B4.1.1:
+                # To ensure that the transfer can be clocked through the SW-DP, after the data
+                # transfer phase the host must do one of the following: [...]
+                #  * If the host is driving the SWD clock, continue to clock the SWD interface with
+                #    at least eight idle cycles. After completing this sequence, the host can stop
+                #    the clock.
+                m.d.sync += [
+                    ctrl.i_stream.p.cmd.eq(swd.Command.Sequence),
+                    ctrl.i_stream.p.len.eq(8),
+                    ctrl.i_stream.p.data.eq(0),
+                ]
+                m.next = "Execute"
 
             with m.State("Execute"):
                 m.d.comb += ctrl.i_stream.valid.eq(1)
@@ -191,11 +229,11 @@ class SWDProbeInterface:
         await self._pipe.flush()
         response = data.Const(SWDResponse, (await self._pipe.recv(1))[0])
         if response.rsp == swd.Response.Error:
-            raise SWDProbeException("communication error", kind=SWDProbeException.Kind.Error)
+            raise SWDProbeException(SWDProbeException.Kind.Error)
         if response.ack == swd.Ack.FAULT:
-            raise SWDProbeException("transaction fault", kind=SWDProbeException.Kind.Fault)
+            raise SWDProbeException(SWDProbeException.Kind.Fault)
         if response.ack == swd.Ack.WAIT:
-            raise SWDProbeException("wait timeout", kind=SWDProbeException.Kind.Timeout)
+            raise SWDProbeException(SWDProbeException.Kind.Timeout)
         assert response.ack == swd.Ack.OK
 
     async def line_reset(self):
@@ -220,7 +258,7 @@ class SWDProbeInterface:
         await self._send_sequence(SWJ_selection_alert_seq)
         await self._send_sequence(SWJ_dormant_to_swd_switch_seq)
 
-    async def _raw_read(self, *, ap_ndp: bool, addr: int) -> int:
+    async def _raw_read(self, *, ap_ndp: Literal[0, 1], addr: int) -> int:
         assert addr in range(0, 0x10, 4)
         await self._send_transfer(ap_ndp=ap_ndp, r_nw=1, addr23=addr >> 2)
         try:
@@ -232,7 +270,7 @@ class SWDProbeInterface:
             raise
         return data
 
-    async def _raw_write(self, *, ap_ndp: bool, addr: int, data: int):
+    async def _raw_write(self, *, ap_ndp: Literal[0, 1], addr: int, data: int):
         assert addr in range(0, 0x10, 4)
         await self._send_transfer(ap_ndp=ap_ndp, r_nw=0, addr23=addr >> 2)
         await self._pipe.send(struct.pack("<L", data))
@@ -240,7 +278,8 @@ class SWDProbeInterface:
             await self._recv_ack()
             self._log(f"wr {'ap' if ap_ndp else 'dp'} addr={addr:#x} data={data:#010x}")
         except SWDProbeException as exn:
-            self._log(f"wr {'ap' if ap_ndp else 'dp'} addr={addr:#x} {exn.kind.value}")
+            self._log(f"wr {'ap' if ap_ndp else 'dp'} addr={addr:#x} data={data:#010x} "
+                      f"{exn.kind.value}")
             raise
 
     async def _update_select(self, **kwargs):
@@ -327,9 +366,9 @@ class SWDProbeInterface:
             On communication error.
         """
         await self._select_ap_addr(ap, reg)
-        return await self._raw_write(ap_ndp=1, addr=reg & 0xf, data=data)
+        await self._raw_write(ap_ndp=1, addr=reg & 0xf, data=data)
 
-    async def initialize(self) -> DP_DPIDR:
+    async def initialize(self, CSYSPWRUP: bool = False) -> DP_DPIDR:
         """Initialize the SW-DP or SWJ-DP.
 
         The initialization process is:
@@ -340,11 +379,13 @@ class SWDProbeInterface:
         4. Write ``DP_ABORT`` to clear all errors.
         5. Write ``CTRL_STAT`` to request debug power-up.
         6. Read ``CTRL_STAT`` to ensure acknowledge of debug power-up.
+        7. **If :py:`CSYSPWRUP`:** Write ``CTRL_STAT`` to request system power-up.
+        8. **If :py:`CSYSPWRUP`:** Read ``CTRL_STAT`` to ensure acknowledge of system power-up.
 
         Raises
         ------
         SWDProbeException
-            On communication error, or if debug power-up request isn't acknowledged.
+            On communication error, or if a power-up request isn't acknowledged.
         """
         await self.jtag_to_swd_v2()
         await self.jtag_to_swd_v1()
@@ -356,7 +397,14 @@ class SWDProbeInterface:
             data=DP_CTRL_STAT(CDBGPWRUPREQ=1).to_int())
         ctrl_stat = DP_CTRL_STAT.from_int(await self.dp_read(reg=DP_CTRL_STAT_addr))
         if not ctrl_stat.CDBGPWRUPACK:
-            raise SWDProbeException("target failed to acknowledge debug power-up request")
+            raise SWDProbeException(message="target failed to acknowledge debug power-up request")
+        if CSYSPWRUP:
+            await self.dp_write(reg=DP_CTRL_STAT_addr,
+                data=DP_CTRL_STAT(CDBGPWRUPREQ=1, CSYSPWRUPREQ=1).to_int())
+            ctrl_stat = DP_CTRL_STAT.from_int(await self.dp_read(reg=DP_CTRL_STAT_addr))
+            if not ctrl_stat.CSYSPWRUPACK:
+                raise SWDProbeException(
+                    message="target failed to acknowledge system power-up request")
         return dpidr
 
     async def iter_aps(self) -> AsyncIterator[tuple[int, AP_IDR]]:
@@ -375,6 +423,50 @@ class SWDProbeInterface:
             if ap_idr.to_int() == 0:
                 break
             yield ap, ap_idr
+
+    async def _mem_ap_setup_access(self, ap: int, addr: int):
+        # The problem here is the value of `Prot`: the exact meaning depends on the specific bus
+        # architecture, and getting it wrong will likely result in faults for certain accesses.
+        # For example, using an Unprivileged access to core debug registers will fault.
+        # ARM guarantees that the reset value of MEM-AP CSR contains the "right" value, so we're
+        # eating the cost of an RMW to reuse that value. A more mature debugger would do something
+        # more involved, likely by examining the bus type. This will require an AP abstraction.
+        ap_csw = MEM_AP_CSW.from_int(await self.ap_read(ap, MEM_AP_CSW_addr))
+        ap_csw.Size = 2
+        await self.ap_write(ap, MEM_AP_CSW_addr, ap_csw.to_int())
+        await self.ap_write(ap, MEM_AP_TAR_addr, addr)
+
+    async def mem_ap_read_word(self, ap: int, addr: int):
+        """Read a word via a MEM-AP.
+
+        Reads the 32-bit value from :py:`addr` via MEM-AP :py:`ap`.
+
+        Note that transfers via a MEM-AP may silently fail under certain conditions, e.g. if
+        the CPU core has not been halted.
+
+        Raises
+        ------
+        SWDProbeException
+            On communication error.
+        """
+        await self._mem_ap_setup_access(ap, addr)
+        return await self.ap_read(ap, MEM_AP_DRW_addr)
+
+    async def mem_ap_write_word(self, ap: int, addr: int, data: int):
+        """Read a word via a MEM-AP.
+
+        Writes the 32-bit value :py:`data` to :py:`addr` via MEM-AP :py:`ap`.
+
+        Note that transfers via a MEM-AP may silently fail under certain conditions, e.g. if
+        the CPU core has not been halted.
+
+        Raises
+        ------
+        SWDProbeException
+            On communication error.
+        """
+        await self._mem_ap_setup_access(ap, addr)
+        await self.ap_write(ap, MEM_AP_DRW_addr, data)
 
 
 class SWDProbeApplet(GlasgowAppletV2):
@@ -436,7 +528,7 @@ class SWDProbeApplet(GlasgowAppletV2):
             "-f", "--file", metavar="FILENAME", type=argparse.FileType("wb"),
             help="dump contents to FILENAME")
         p_dump_memory.add_argument(
-            "--ap", metavar="INDEX", default=0,
+            "--ap", metavar="INDEX", default=0, type=int,
             help="access memory via MEM-AP #INDEX")
 
     @staticmethod
@@ -472,19 +564,24 @@ class SWDProbeApplet(GlasgowAppletV2):
 
             case "dump-memory":
                 ap_cfg = MEM_AP_CFG.from_int(await self.swd_iface.ap_read(args.ap, MEM_AP_CFG_addr))
+                ap_csw = MEM_AP_CSW.from_int(await self.swd_iface.ap_read(args.ap, MEM_AP_CSW_addr))
+                if not ap_csw.DeviceEn:
+                    raise SWDProbeException(message="MEM-AP is disabled")
 
                 data = []
                 addr = args.address
                 last = args.address + args.length
                 await self.swd_iface.ap_write(args.ap, MEM_AP_CSW_addr,
                     MEM_AP_CSW(AddrInc=1, Size=2).to_int())
-                while addr < last:
-                    await self.swd_iface.ap_write(args.ap, MEM_AP_TAR_addr, addr)
-                    block = await self.swd_iface.ap_read_block(args.ap, MEM_AP_DRW_addr,
-                        min(0x100, (last - addr) >> 2))
-                    data += block
-                    addr += len(block) << 2
-                    self._show_progress(len(data) << 2, args.length)
+                with Progress(action="reading",
+                        total=args.length, item="B", scale=1024) as progress:
+                    while addr < last:
+                        await self.swd_iface.ap_write(args.ap, MEM_AP_TAR_addr, addr)
+                        block = await self.swd_iface.ap_read_block(args.ap, MEM_AP_DRW_addr,
+                            min(0x100, (last - addr) >> 2))
+                        data += block
+                        addr += len(block) << 2
+                        progress.advance(len(block) << 2)
 
                 image = b"".join(word.to_bytes(4, "big" if ap_cfg.BE else "little")
                                  for word in data)

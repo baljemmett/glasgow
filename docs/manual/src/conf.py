@@ -4,9 +4,23 @@ is_production = True if os.getenv("DOCS_IS_PRODUCTION", "").lower() in ('1', 'ye
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "software"))
 import glasgow
 
-html_title = project = "Glasgow Interface\u00a0Explorer"
+# Otherwise on newer Python, `argparse` will render output using ANSI escape sequences, and they
+# will get inserted into `sphinxcontrib.autoprogram` output.
+os.environ["NO_COLOR"] = "1"
+
+language = os.environ.get("DOCS_LANGUAGE", "en")
+match language:
+    case "en":
+        project = "Glasgow Interface\u00a0Explorer"
+        copyright = "2020—%Y, Glasgow Interface Explorer contributors"
+        html_baseurl = "https://glasgow-embedded.org/en/"
+    case "zh":
+        project = "Glasgow 可重构数字接口调试器"
+        copyright = "2020—%Y，Glasgow 可重构数字接口调试器贡献者"
+        html_baseurl = "https://glasgow-embedded.cn/zh/"
+
+# We don't do versioned releases.
 release = version = ""
-copyright = "2020—%Y, Glasgow Interface Explorer contributors"
 
 extensions = [
     "myst_parser",
@@ -18,7 +32,13 @@ extensions = [
     "sphinx_inline_tabs",
     "sphinxcontrib.autoprogram",
     "enum_tools.autoenum",
+    "myst_parser",
 ]
+
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md":  "markdown",
+}
 
 highlight_language = "text"
 
@@ -43,24 +63,48 @@ napoleon_include_special_with_doc = True
 todo_include_todos = True
 todo_emit_warnings = True
 
-intersphinx_mapping = {"python": ("https://docs.python.org/3", None)}
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", os.getenv("INTERSPHINX_PYTHON")),
+}
 
 copybutton_prompt_is_regexp = True
 copybutton_prompt_text = r">>> |\.\.\. |\$ |> "
 copybutton_copy_empty_lines = False
 
+locale_dirs = ["../locale/"]
+gettext_compact = False
+
+templates_path = ["_templates/"]
+
 html_use_modindex = False
 html_use_index = False
 
+html_title = project
 html_theme = "furo"
-html_baseurl = "https://glasgow-embedded.org/latest/"
 html_static_path = ["_static"]
 html_css_files = [
-      "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/fontawesome.min.css",
-      "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/solid.min.css",
-      "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/brands.min.css",
+      "font-awesome/css/fontawesome.min.css",
+      "font-awesome/css/solid.min.css",
+      "font-awesome/css/brands.min.css",
       "styles/custom.css",
 ]
+html_sidebars = {
+    "**": [
+        "sidebar/brand.html",
+        "sidebar/search.html",
+        "sidebar/scroll-start.html",
+        "sidebar/navigation.html",
+        "sidebar/scroll-end.html",
+        "sidebar/variant-selector.html",
+        "sidebar/language-selector.html",
+    ],
+}
+html_context = {
+    "languages": {
+        "en": "English",
+        "zh": "汉语",
+    },
+}
 html_theme_options = {
     "top_of_page_button": "edit",
     "source_repository": "https://github.com/GlasgowEmbedded/glasgow/",
@@ -86,8 +130,8 @@ if is_production:
             "color-announcement-text": "#64cc69",
         },
         "announcement":
-            "Production units are being shipped by Mouser. "
-            "<a href='https://crowdsupply.com/1bitsquared/glasgow'>Order yours now!</a>"
+            "The latest revision, revD, is in pre-launch phase on CrowdSupply. "
+            "<a href='https://www.crowdsupply.com/fully-automated/glasgow-interface-explorer-revd'>Subscribe now!</a>"
     })
 else:
     html_theme_options.update({

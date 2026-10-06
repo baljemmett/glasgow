@@ -2,7 +2,6 @@ import re
 import os
 import sys
 import ast
-import logging
 import contextlib
 import asyncio
 import signal
@@ -10,20 +9,24 @@ import argparse
 import textwrap
 import platform
 import unittest
+import logging as pylogging
 from datetime import datetime
 
+import colorama
 from amaranth import UnusedElaboratable
 from fx2 import FX2Config, VID_CYPRESS, PID_FX2
 from fx2.format import input_data, diff_data
 
 from . import __version__
-from .support.logging import *
+from .support import logging
 from .support.asignal import *
+from .support.progress import TqdmProgressImpl
 from .support.plugin import PluginRequirementsUnmet, PluginLoadError
-from .abstract import ClockingError
+from .support.usb import ErrorDisconnected
+from .abstract import ClockingError, GlasgowPort
 from .hardware.device import GlasgowDeviceError, GlasgowDevice, GlasgowDeviceConfig
 from .hardware.device import FX2BootloaderDevice, VID_QIHW, PID_GLASGOW
-from .hardware.toolchain import ToolchainNotFound
+from .hardware.toolchain import ToolchainNotFound, ToolOutOfDate
 from .hardware.build_plan import GatewareBuildError
 from .hardware.assembly import HardwareAssembly
 from .legacy import DeprecatedTarget
@@ -96,7 +99,11 @@ def version_info():
 
 
 def create_argparser():
-    parser = argparse.ArgumentParser(formatter_class=TextHelpFormatter, fromfile_prefix_chars="@")
+    parser = argparse.ArgumentParser(
+        prog="glasgow",
+        formatter_class=TextHelpFormatter,
+        fromfile_prefix_chars="@"
+    )
 
     parser.add_argument(
         "-V", "--version", action="version", version=version_info(),
@@ -203,6 +210,10 @@ def get_argparser():
                 help += " (PREVIEW QUALITY APPLET)"
                 description = "    This applet is PREVIEW QUALITY and may CORRUPT DATA or " \
                               "have missing features. Use at your own risk.\n" + description
+            if applet_cls.deprecated:
+                help += " (DEPRECATED APPLET)"
+                description = "    This applet is DEPRECATED and WILL BE REMOVED soon: " \
+                              f"{applet_cls.deprecated}.\n" + description
             if applet_cls.required_revision > "A0":
                 help += f" (rev{applet_cls.required_revision}+)"
                 description += f"\n    This applet requires " \
@@ -273,7 +284,7 @@ def get_argparser():
     parser = create_argparser()
 
     def revision(arg):
-        revisions = ["A0", "B0", "C0", "C1", "C2", "C3"]
+        revisions = ["A0", "B0", "C0", "C1", "C2", "C3", "D0"]
         if arg in revisions:
             return arg
         else:
@@ -281,7 +292,7 @@ def get_argparser():
                 f"{arg} is not a valid revision (should be one of: {', '.join(revisions)})")
 
     def serial(arg):
-        if re.match(r"^[A-C][0-9]-\d{8}T\d{6}Z$", arg):
+        if re.match(r"^[A-D][0-9]-\d{8}T\d{6}Z$", arg):
             return arg
         else:
             raise argparse.ArgumentTypeError(f"{arg} is not a valid serial number")
@@ -294,27 +305,32 @@ def get_argparser():
     subparsers.required = True
 
     def add_ports_arg(parser):
-        parser.add_argument(
-            "ports", metavar="PORTS", type=str, nargs="?", default="AB",
-            help="I/O port set (one or more of: A B, default: all)")
+        def ports(arg):
+            if "*" in arg:
+                return None
+            return "".join(str(GlasgowPort(char)) for char in arg)
 
-    def add_voltage_arg(parser, help):
+        all_ports = " ".join(map(str, GlasgowPort))
         parser.add_argument(
-            "voltage", metavar="VOLTS", type=float, nargs="?", default=None,
-            help=f"{help} (range: 1.8-5.0)")
+            "ports", metavar="PORTS", nargs="?", type=ports, default="*",
+            help=f"I/O port set (one or more of: {all_ports}, default: %(default)s)")
 
     p_voltage = subparsers.add_parser(
         "voltage", formatter_class=TextHelpFormatter,
-        help="query or set I/O port voltage")
+        help="query or set I/O port configuration and measurements")
     add_ports_arg(p_voltage)
-    add_voltage_arg(p_voltage,
-        help="I/O port voltage")
+    p_voltage.add_argument(
+        "voltage", metavar="VOLTS", type=float, nargs="?", default=None,
+        help=f"I/O port voltage (range: revABC 1.65-5.0 V, revD 0.9-5.5 V)")
+    p_voltage.add_argument(
+        "trip_current", metavar="AMPS", type=float, nargs="?", default=None,
+        help=f"I/O port trip current (revC2+; range: 0.000-0.325 A)")
     p_voltage.add_argument(
         "--tolerance", metavar="PCT", type=float, default=10.0,
         help="raise alert if measured voltage deviates by more than ±PCT%% (default: %(default)s)")
     p_voltage.add_argument(
         "--alert", dest="set_alert", default=False, action="store_true",
-        help="raise an alert if Vsense is out of range of Vio")
+        help="raise an alert and disable Vsupply if Vsense is out of range of Vsupply")
 
     p_safe = subparsers.add_parser(
         "safe", formatter_class=TextHelpFormatter,
@@ -324,8 +340,9 @@ def get_argparser():
         "voltage-limit", formatter_class=TextHelpFormatter,
         help="limit I/O port voltage as a safety mechanism")
     add_ports_arg(p_voltage_limit)
-    add_voltage_arg(p_voltage_limit,
-        help="maximum allowed I/O port voltage")
+    p_voltage_limit.add_argument(
+        "voltage", metavar="VOLTS", type=float, nargs="?", default=None,
+        help=f"maximum allowed I/O port voltage (range: revABC 1.8-5.0 V, revD 1.2-5.5 V)")
 
     def add_run_args(parser):
         g_run_bitstream = parser.add_mutually_exclusive_group()
@@ -349,6 +366,11 @@ def get_argparser():
     p_repl = subparsers.add_parser(
         "repl", formatter_class=TextHelpFormatter,
         help="run an applet and open a REPL to use its programming interface")
+    p_repl.add_argument(
+        "--prelude", metavar="FILENAME", type=argparse.FileType("r", encoding="utf-8"),
+        action="append",
+        default=[],
+        help="run Python script(s) FILENAME first, as if it was typed in the REPL")
     add_run_args(p_repl)
     p_repl.add_build_func(lambda: add_applet_arg(p_repl, mode="repl", required=True))
 
@@ -397,6 +419,10 @@ def get_argparser():
         "--remove-bitstream", default=False, action="store_true",
         help="remove any bitstream present")
     p_flash.add_build_func(lambda: add_applet_arg(g_flash_bitstream, mode="build"))
+
+    p_flash.add_argument(
+        "--advertise-webusb", choices=("yes", "no"),
+        help="whether to cause the host PC to display a notification with the WebUSB URL")
 
     p_build = subparsers.add_parser(
         "build", formatter_class=TextHelpFormatter,
@@ -483,14 +509,15 @@ def _applet(assembly, args):
         raise SystemExit()
 
 
-class TerminalFormatter(logging.Formatter):
+class TerminalFormatter(pylogging.Formatter):
     DEFAULT_COLORS = {
-        "TRACE"   : "\033[0m",
-        "DEBUG"   : "\033[36m",
-        "INFO"    : "\033[1m",
-        "WARNING" : "\033[1;33m",
-        "ERROR"   : "\033[1;31m",
-        "CRITICAL": "\033[1;41m",
+        "TRACE"   : colorama.Fore.LIGHTBLACK_EX,
+        "DEBUG"   : colorama.Fore.LIGHTCYAN_EX,
+        "INFO"    : colorama.Fore.WHITE,
+        "WARNING" : colorama.Fore.LIGHTYELLOW_EX,
+        "ERROR"   : colorama.Fore.RED,
+        "CRITICAL": colorama.Back.RED,
+        "RESET":    colorama.Style.RESET_ALL,
     }
 
     def __init__(self, *args, **kwargs):
@@ -503,11 +530,19 @@ class TerminalFormatter(logging.Formatter):
 
     def format(self, record):
         color = self.colors.get(record.levelname, "")
-        # glasgow.applet.foo → g.applet.foo
+        # glasgow.hardware.foo → g.hardware.foo
         record.name = record.name.replace("glasgow.", "g.")
-        # applet.memory._25x → applet.memory.25x
+        # glasgow.hardware.foo → g.h.foo
+        record.name = record.name.replace("g.hardware.", "g.h.")
+        # glasgow.hardware.build_plan → g.h.bp
+        record.name = record.name.replace("g.h.build_plan", "g.h.bp")
+        # glasgow.applet.foo → g.a.foo
+        record.name = record.name.replace("g.applet.", "g.a.")
+        # glasgow.applet.interface. → g.a.i.foo
+        record.name = record.name.replace("g.a.interface.", "g.a.i.")
+        # applet.memory._25q → applet.memory.25q
         record.name = record.name.replace("._", ".")
-        return f"{color}{super().format(record)}\033[0m"
+        return f"{color}{super().format(record)}{self.colors['RESET']}"
 
 
 class SubjectFilter:
@@ -524,33 +559,37 @@ class SubjectFilter:
 
 
 def create_logger():
-    root_logger = logging.getLogger()
+    root_logger = pylogging.getLogger()
 
     term_formatter_args = {"style": "{",
         "fmt": "{levelname[0]:s}: {name:s}: {message:s}"}
-    term_handler = logging.StreamHandler()
-    if sys.stderr.isatty() and sys.platform != "win32":
+    term_handler = pylogging.StreamHandler()
+    if sys.stderr.isatty():
+        colorama.just_fix_windows_console()
         term_handler.setFormatter(TerminalFormatter(**term_formatter_args))
     else:
-        term_handler.setFormatter(logging.Formatter(**term_formatter_args))
+        term_handler.setFormatter(pylogging.Formatter(**term_formatter_args))
     root_logger.addHandler(term_handler)
     return term_handler
 
 
 def configure_logger(args, term_handler):
-    root_logger = logging.getLogger()
+    root_logger = pylogging.getLogger()
 
     file_formatter_args = {"style": "{",
         "fmt": "[{asctime:s}] {levelname:s}: {name:s}: {message:s}"}
     file_handler = None
     if args.log_file:
-        file_handler = logging.StreamHandler(args.log_file)
-        file_handler.setFormatter(logging.Formatter(**file_formatter_args))
+        file_handler = pylogging.StreamHandler(args.log_file)
+        file_handler.setFormatter(pylogging.Formatter(**file_formatter_args))
         root_logger.addHandler(file_handler)
 
     level = logging.INFO + args.quiet * 10 - args.verbose * 10
     if level < 0 or args.no_shorten:
-        dump_hex.limit = dump_bin.limit = dump_seq.limit = dump_mapseq.limit = None
+        logging.dump_hex.limit = None
+        logging.dump_bin.limit = None
+        logging.dump_seq.limit = None
+        logging.dump_mapseq.limit = None
 
     if args.log_file or args.filter_log:
         term_handler.addFilter(SubjectFilter(level, args.filter_log))
@@ -594,6 +633,10 @@ async def wait_for_sigint():
 async def main() -> int:
     term_handler = file_handler = device = None
     try:
+        # This intercepts stdin/stdout, so do it before creating a logger or anything else that
+        # might capture those file objects.
+        TqdmProgressImpl().register()
+
         # Handle log messages emitted during construction of the argument parser (e.g. by
         # the plugin subsystem).
         term_handler = create_logger()
@@ -606,10 +649,15 @@ async def main() -> int:
             device = await GlasgowDevice.find(args.serial)
             assembly = HardwareAssembly(device=device)
 
+        if hasattr(args, "ports") and args.ports is None:
+            args.ports = device.all_ports
+
         if args.action == "voltage":
             if args.voltage is not None:
                 await device.reset_alert(args.ports)
-                await device.poll_alert() # clear any remaining alerts
+                await device.clear_faults(args.ports)
+                if args.trip_current is not None:
+                    await device.set_trip_current(args.ports, args.trip_current)
                 try:
                     await device.set_voltage(args.ports, args.voltage)
                 except:
@@ -620,35 +668,47 @@ async def main() -> int:
                     await device.set_alert_tolerance(args.ports, args.voltage,
                                                      args.tolerance / 100)
 
-            print("Port\tVio\tVlimit\tVsense\tVsense(range)")
-            alerts = await device.poll_alert()
+            print("Port\tVsupply\tVlimit\tIsupply\tIalert\tVsense\tVsense(alert)")
             for port in args.ports:
-                vio    = await device.get_voltage(port)
-                vlimit = await device.get_voltage_limit(port)
-                vsense = await device.measure_voltage(port)
-                alert  = await device.get_alert(port)
-                notice = ""
-                if port in alerts:
-                    notice += " (ALERT)"
-                print(f"{port}\t{vio:.2}\t{vlimit:.2}\t{vsense:.3}\t{alert[0]:.2}-{alert[1]:.2}\t{notice}"
-                      )
+                vsupply = await device.get_voltage(port)
+                vlimit  = await device.get_voltage_limit(port)
+                vsense  = await device.measure_voltage(port)
+                alert   = await device.get_alert(port)
+                if device.measures_current:
+                    isupply = await device.measure_current(port)
+                    ilimit  = await device.get_trip_current(port)
+                else:
+                    isupply = None
+                    ilimit  = None
+                faults  = await device.get_faults(port)
+                print("\t".join([
+                    port,
+                    f"{vsupply:.3f}",
+                    f"{vlimit:.3f}",
+                    "n/a" if isupply is None else
+                        f"{isupply:.3f}" if isupply < 0.32767 else
+                            "(SHORT)",
+                    "n/a" if ilimit is None else f"{ilimit:.3f}",
+                    f"{vsense:.3f}",
+                    f"{alert[0]:.3f}-{alert[1]:.3f}",
+                    "(FAULT)" if faults else "",
+                ]))
 
         if args.action == "safe":
-            await device.reset_alert("AB")
-            await device.set_voltage("AB", 0.0)
-            await device.poll_alert() # clear any remaining alerts
+            await device.reset_alert(device.all_ports)
+            await device.set_voltage(device.all_ports, 0.0)
+            await device.clear_faults(device.all_ports)
             logger.info("all ports safe")
 
         if args.action == "voltage-limit":
             if args.voltage is not None:
                 await device.set_voltage_limit(args.ports, args.voltage)
 
-            print("Port\tVio\tVlimit")
+            print("Port\tVsupply\tVlimit")
             for port in args.ports:
-                vio    = await device.get_voltage(port)
-                vlimit = await device.get_voltage_limit(port)
-                print(f"{port}\t{vio:.2}\t{vlimit:.2}"
-                      )
+                vsupply = await device.get_voltage(port)
+                vlimit  = await device.get_voltage_limit(port)
+                print(f"{port}\t{vsupply:.3f}\t{vlimit:.3f}")
 
         if args.action in ("run", "repl", "script"):
             applet, target = _applet(assembly, args)
@@ -678,6 +738,10 @@ async def main() -> int:
                             if args.action == "run":
                                 return await applet.run(args)
                             elif args.action == "repl":
+                                for prelude_file in args.prelude:
+                                    code = compile(prelude_file.read(), filename=prelude_file.name,
+                                        mode="exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                                    await applet.script(args, code)
                                 await applet.repl(args)
                             elif args.action == "script":
                                 if args.script_file:
@@ -824,13 +888,13 @@ async def main() -> int:
 
         if args.action == "flash":
             logger.info("reading device configuration")
-            header = await device.read_eeprom("fx2", 0, 8 + 4 + GlasgowDeviceConfig.size)
+            header = await device.read_eeprom(0, 8 + 4 + GlasgowDeviceConfig.size())
             header[0] = 0xC2 # see below
 
             fx2_config = FX2Config.decode(header, partial=True)
             if (len(fx2_config.firmware) != 1 or
-                    fx2_config.firmware[0][0] != 0x4000 - GlasgowDeviceConfig.size or
-                    len(fx2_config.firmware[0][1]) != GlasgowDeviceConfig.size):
+                    fx2_config.firmware[0][0] != 0x4000 - GlasgowDeviceConfig.size() or
+                    len(fx2_config.firmware[0][1]) != GlasgowDeviceConfig.size()):
                 raise SystemExit("Unrecognized or corrupted configuration block")
             glasgow_config = GlasgowDeviceConfig.decode(fx2_config.firmware[0][1])
 
@@ -846,36 +910,13 @@ async def main() -> int:
             else:
                 logger.info("device does not have flashed bitstream")
 
-            new_bitstream = b""
-            if args.remove_bitstream:
-                logger.info("removing bitstream")
-                glasgow_config.bitstream_size = 0
-                glasgow_config.bitstream_id   = b"\x00"*16
-            elif args.bitstream:
-                logger.info("using bitstream from %s", args.bitstream.name)
-                with args.bitstream as f:
-                    new_bitstream_id = f.read(16)
-                    new_bitstream    = f.read()
-                    glasgow_config.bitstream_size = len(new_bitstream)
-                    glasgow_config.bitstream_id   = new_bitstream_id
-            elif args.applet:
-                logger.info("generating bitstream for applet %s", args.applet)
-                assembly = HardwareAssembly(revision=device.revision)
-                applet, _multiplexer = _applet(assembly, args)
-                plan = assembly.artifact()
-                new_bitstream_id = plan.bitstream_id
-                new_bitstream    = await plan.get_bitstream()
+            match args.advertise_webusb:
+                case "yes":
+                    glasgow_config.advertise_webusb = True
+                case "no":
+                    glasgow_config.advertise_webusb = False
 
-                # We always build and reflash the bitstream in case the one currently
-                # in EEPROM is corrupted. If we only compared the ID, there would be
-                # no easy way to recover from that case. There's also no point in
-                # storing the bitstream hash (as opposed to Verilog hash) in the ID,
-                # as building the bitstream takes much longer than flashing it.
-                logger.info("generated bitstream ID %s", new_bitstream_id.hex())
-                glasgow_config.bitstream_size = len(new_bitstream)
-                glasgow_config.bitstream_id   = new_bitstream_id
-
-            fx2_config.firmware[0] = (0x4000 - GlasgowDeviceConfig.size, glasgow_config.encode())
+            fx2_config.firmware[0] = (0x4000 - GlasgowDeviceConfig.size(), glasgow_config.encode())
 
             if args.remove_firmware:
                 logger.info("removing firmware")
@@ -893,39 +934,56 @@ async def main() -> int:
                             fx2_config.append(addr, chunk)
                 else:
                     logger.info("using built-in firmware")
-                    for (addr, chunk) in GlasgowDevice.firmware_data():
+                    for (addr, chunk) in GlasgowDevice._fx2_firmware_data():
                         fx2_config.append(addr, chunk)
                 fx2_config.disconnect = True
                 new_image = fx2_config.encode()
 
-            if new_bitstream:
-                logger.info("programming bitstream")
-                old_bitstream = await device.read_eeprom("ice", 0, len(new_bitstream))
-                if old_bitstream != new_bitstream:
-                    for (addr, chunk) in diff_data(old_bitstream, new_bitstream):
-                        await device.write_eeprom("ice", addr, chunk)
-
-                    logger.info("verifying bitstream")
-                    if await device.read_eeprom("ice", 0, len(new_bitstream)) != new_bitstream:
-                        logger.critical("bitstream programming failed")
-                        return 1
-                else:
-                    logger.info("bitstream identical")
+            if glasgow_config.revision >= "D0":
+                # Inject the STM32 firmware into the image. This is done unconditionally, as FX2
+                # firmware that is loaded on the fly will still try to read the STM32 firmware from
+                # the EEPROM. This is a bit dirty and less reliable than ideal, and fundamentally
+                # relies on the STM32 firmware never changing, as we don't have any way to detect
+                # that there is a mismatch between expected and actual STM32 firmware interface.
+                assert len(new_image) <= 0x5000
+                new_image = new_image.ljust(0x5000, b"\xff") + GlasgowDevice._stm32_firmware_data()
 
             logger.info("programming configuration and firmware")
-            old_image = await device.read_eeprom("fx2", 0, len(new_image))
+            old_image = await device.read_eeprom(0, len(new_image))
             if old_image != new_image:
                 for (addr, chunk) in diff_data(old_image, new_image):
-                    await device.write_eeprom("fx2", addr, chunk)
+                    await device.write_eeprom(addr, chunk)
 
                 logger.info("verifying configuration and firmware")
-                if await device.read_eeprom("fx2", 0, len(new_image)) != new_image:
+                if await device.read_eeprom(0, len(new_image)) != new_image:
                     logger.critical("configuration/firmware programming failed")
                     return 1
 
                 logger.warning("power cycle the device to apply changes")
             else:
                 logger.info("configuration and firmware identical")
+
+            bitstream_id   = b"\x00"*8
+            bitstream_data = b""
+            if args.remove_bitstream:
+                logger.info("removing bitstream")
+            elif args.bitstream:
+                logger.info("using bitstream from %s", args.bitstream.name)
+                with args.bitstream as f:
+                    bitstream_id   = f.read(8)
+                    bitstream_data = f.read()
+            elif args.applet:
+                logger.info("generating bitstream for applet %s", args.applet)
+                assembly = HardwareAssembly(revision=device.revision)
+                applet, _multiplexer = _applet(assembly, args)
+                plan = assembly.artifact()
+                bitstream_id   = plan.bitstream_id
+                bitstream_data = await plan.get_bitstream()
+            else:
+                return 0
+            if bitstream_data:
+                logger.info("flashing bitstream ID %s", bitstream_id.hex())
+            await device.flash_bitstream(bitstream_data, bitstream_id)
 
         if args.action == "build":
             assembly = HardwareAssembly(revision=args.rev)
@@ -974,9 +1032,10 @@ async def main() -> int:
 
             device_id = GlasgowDeviceConfig.encode_revision(args.factory_rev)
             glasgow_config = GlasgowDeviceConfig(args.factory_rev, args.factory_serial,
-                                           manufacturer=args.factory_manufacturer,
-                                           modified_design=(args.factory_modified_design != "no"))
-            firmware_data = GlasgowDevice.firmware_data()
+                manufacturer=args.factory_manufacturer,
+                modified_design=(args.factory_modified_design != "no"),
+                advertise_webusb=True)
+            firmware_data = GlasgowDevice._fx2_firmware_data()
 
             if args.reinitialize:
                 vid, pid = VID_QIHW, PID_GLASGOW
@@ -992,7 +1051,7 @@ async def main() -> int:
 
             fx2_config = FX2Config(vendor_id=VID_QIHW, product_id=PID_GLASGOW,
                                    device_id=device_id, i2c_400khz=True, disconnect=True)
-            fx2_config.append(0x4000 - glasgow_config.size, glasgow_config.encode())
+            fx2_config.append(0x4000 - glasgow_config.size(), glasgow_config.encode())
             for (addr, chunk) in firmware_data:
                 fx2_config.append(addr, chunk)
             image = fx2_config.encode()
@@ -1008,8 +1067,12 @@ async def main() -> int:
             logger.warning("power cycle the device to finish the operation")
 
         if args.action == "list":
-            for serial in sorted(await GlasgowDevice.enumerate()):
-                print(serial)
+            devices = await GlasgowDevice.enumerate()
+            if not devices:
+                logger.warning("no devices available")
+            else:
+                for serial in sorted(devices):
+                    print(serial)
             return 0
 
     # Device-related errors
@@ -1029,6 +1092,10 @@ async def main() -> int:
         print(e.metadata.description)
         return 3
 
+    except ToolOutOfDate as e:
+        logger.error(e)
+        return 3
+
     except ToolchainNotFound as e:
         return 3
 
@@ -1041,13 +1108,16 @@ async def main() -> int:
         return e.code
 
     finally:
-        root_logger = logging.getLogger()
+        root_logger = pylogging.getLogger()
         root_logger.removeHandler(term_handler)
         if file_handler is not None:
             root_logger.removeHandler(file_handler)
 
         if device is not None:
-            await device.close()
+            try:
+                await device.close()
+            except ErrorDisconnected:
+                pass
 
     return 0
 

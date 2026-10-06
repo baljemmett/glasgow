@@ -18,7 +18,7 @@ classifiers = [
   "Topic :: System :: Hardware",
 ]
 
-requires-python = ">=3.11, <4"
+requires-python = ">=3.13, <4"
 
 # Glasgow has only a few carefully chosen dependencies. The rationale for having them, as well as
 # the rationale for the particular version constraint, is explained below, and should be kept
@@ -31,7 +31,7 @@ dependencies = [
   # `typing_extensions` provides shims for such features. It uses SemVer.
   "typing_extensions>=4.8,<5",
   # Amaranth is the core of the Glasgow software/gateware interoperability layer. It uses SemVer.
-  "amaranth>=0.5.8,<0.6",
+  "amaranth>=0.5.9,<0.6",
   # `packaging` is used in the plugin system, `support.plugin`. It uses CalVer: the major version
   # is the two last digits of the year and the minor version is the release within that year.
   "packaging>=23.0",
@@ -40,7 +40,7 @@ dependencies = [
   "platformdirs>=3.0.0,<5",
   # `fx2` is effectively maintained together with Glasgow. It uses SemVer, and keeps backward
   # compatibility within the 0.x release series.
-  "fx2>=0.11,<1",
+  "fx2>=0.16,<1",
   # `libusb1` is used to communicate with the device, and its API mirrors the stable API/ABI of
   # of the native `libusb1` library. It increases major version when dropping support for older
   # Python versions.
@@ -48,11 +48,21 @@ dependencies = [
   # `cobs` is used to multiplex communication streams in applets. It uses an ad-hoc versioning
   # system.
   "cobs>=1.2.1",
+  # `tqdm` is used to compute and render progress indicatrs. It uses SemVer.
+  "tqdm>=4.67.3",
   # `pyvcd` is used in the applet analyzer to dump waveform files. It is also a dependency of
   # Amaranth, and the version range here must be compatible with Amaranth's.
   "pyvcd>=0.4.1,<0.5",
+  # `pyreadline3` is used on Windows to provide line editing. It is unclear which versioning scheme
+  # it uses.
+  "pyreadline3>=3.5.6; platform_system == 'Windows'",
+  # `colorama` is used to color terminal output on all platforms, but is required especially on
+  # Windows. It seems to use SemVer.
+  "colorama>=0.4.6,<0.5",
+  # `enum-tools` is used for documenting enums. It is unclear which versioning scheme it uses.
+  "enum-tools==0.13.0",
   # `importlib_resources` is used to shim over Python API incompatibilities. It uses SemVer.
-  "importlib_resources~=6.5.2",
+  "importlib_resources~=7.1.0",
 ]
 
 [project.optional-dependencies]
@@ -65,14 +75,17 @@ builtin-toolchain = [
   # `yowasp-runtime` is a dependency of other toolchain components, and it is constrained here to
   # the lowest that has features transitively required by Glasgow.
   "yowasp-runtime>=1.42",
-  # Most versions of Yosys and nextpnr work; the minimum versions listed here are known good.
-  "yowasp-yosys>=0.31.0.13,!=0.54.*,!=0.55.*,!=0.56.*",
+  # Most versions of Yosys and nextpnr-ice40 work; the minimum versions listed here are known good.
+  "yowasp-yosys>=0.31.0.13,!=0.54.*,!=0.55.*,!=0.56.*,!=0.64.*",
   "yowasp-nextpnr-ice40>=0.1",
+  # nextpnr-ecp5 *must* include commit `7c667eeba362a8538396f9c4dc9bd1a168b35fa3`, or any applet
+  # that uses IO gearboxes will be broken due to PLL placement issues.
+  "yowasp-nextpnr-ecp5>=0.10.0.88.post806.dev0",
 ]
 
 # The rest of the optional dependences belong to plugins (applets, loggers, etc.)
 http = [
-  "aiohttp>=3.9.0,<3.12.0", # aiohttp 3.12.0 doesn't install on Python 3.11 for some reason
+  "aiohttp>=3.13.0",
   "aiohttp-remotes>=1.2,<2",
 ]
 numpy = [
@@ -85,9 +98,14 @@ glasgow = "glasgow.cli:run_main"
 
 [project.entry-points."glasgow.applet"]
 selftest = "glasgow.applet.internal.selftest:SelfTestApplet"
+memtest = "glasgow.applet.internal.memtest:MemoryTestApplet"
 benchmark = "glasgow.applet.internal.benchmark:BenchmarkApplet"
+calibrate-clock = "glasgow.applet.measure.calibrate_clock:CalibrateClockApplet"
+curve-trace = "glasgow.applet.measure.curve_trace:CurveTraceApplet"
+generate-prn-noise = "glasgow.applet.measure.prn_noise:GeneratePRNNoiseApplet"
 
 analyzer = "glasgow.applet.interface.analyzer:AnalyzerApplet"
+analyzer2 = "glasgow.applet.interface.analyzer2:AnalyzerApplet"
 uart = "glasgow.applet.interface.uart:UARTApplet"
 uart-analyzer = "glasgow.applet.interface.uart_analyzer:UARTAnalyzerApplet"
 spi-analyzer = "glasgow.applet.interface.spi_analyzer:SPIAnalyzerApplet"
@@ -109,7 +127,7 @@ jtag-xvc = "glasgow.applet.bridge.jtag_xvc:JTAGXVCApplet"
 probe-rs = "glasgow.applet.bridge.probe_rs:ProbeRsApplet"
 
 memory-24x = "glasgow.applet.memory._24x:Memory24xApplet"
-memory-25x = "glasgow.applet.memory._25x:Memory25xApplet"
+memory-25q = "glasgow.applet.memory._25q:Memory25QApplet"
 memory-onfi = "glasgow.applet.memory.onfi:MemoryONFIApplet"
 memory-prom = "glasgow.applet.memory.prom:MemoryPROMApplet"
 memory-floppy = "glasgow.applet.memory.floppy:MemoryFloppyApplet"
@@ -125,12 +143,13 @@ program-ice40-sram = "glasgow.applet.program.ice40_sram:ProgramICE40SRAMApplet"
 program-m16c = "glasgow.applet.program.m16c:ProgramM16CApplet"
 program-mec16xx = "glasgow.applet.program.mec16xx:ProgramMEC16xxApplet"
 program-nrf24lx1 = "glasgow.applet.program.nrf24lx1:ProgramNRF24Lx1Applet"
-program-stusb4500-nvm = "glasgow.applet.program.stusb4500_nvm:StUsb4500NvmApplet"
+program-stusb4500-nvm = "glasgow.applet.program.stusb4500_nvm:STUSB4500NVMApplet"
 program-xc6s = "glasgow.applet.program.xc6s:ProgramXC6SApplet"
 program-xc9500 = "glasgow.applet.program.xc9500:ProgramXC9500Applet"
 program-xc9500xl = "glasgow.applet.program.xc9500xl:ProgramXC9500XLApplet"
 program-xpla3 = "glasgow.applet.program.xpla3:ProgramXPLA3Applet"
 
+control-clock = "glasgow.applet.control.clock:ControlClockApplet"
 control-gpio = "glasgow.applet.control.gpio:ControlGPIOApplet"
 control-mdio = "glasgow.applet.control.mdio:ControlMDIOApplet"
 control-servo = "glasgow.applet.control.servo:ControlServoApplet"
@@ -141,13 +160,14 @@ sensor-bmx280 = "glasgow.applet.sensor.bmx280:SensorBMx280Applet"
 sensor-hcsr04 = "glasgow.applet.sensor.hcsr04:SensorHCSR04Applet"
 sensor-hx711 = "glasgow.applet.sensor.hx711:SensorHX711Applet"
 sensor-ina260 = "glasgow.applet.sensor.ina260:SensorINA260Applet"
+sensor-max31855 = "glasgow.applet.sensor.max31855:SensorMAX31855Applet"
 sensor-mouse-ps2 = "glasgow.applet.sensor.mouse_ps2:SensorMousePS2Applet"
 sensor-pmsx003 = "glasgow.applet.sensor.pmsx003:SensorPMSx003Applet"
 sensor-sen5x = "glasgow.applet.sensor.sen5x:SensorSEN5xApplet"
 sensor-scd30 = "glasgow.applet.sensor.scd30:SensorSCD30Applet"
+sensor-qmc5883p = "glasgow.applet.sensor.qmc5883p:SensorQMC5883PApplet"
 
 display-hd44780 = "glasgow.applet.display.hd44780:DisplayHD44780Applet"
-display-pdi = "glasgow.applet.display.pdi:DisplayPDIApplet"
 
 audio-dac = "glasgow.applet.audio.dac:AudioDACApplet"
 audio-yamaha-opx = "glasgow.applet.audio.yamaha_opx:AudioYamahaOPxApplet [http]"
@@ -160,6 +180,7 @@ video-ws2812-output = "glasgow.applet.video.ws2812_output:VideoWS2812OutputApple
 radio-nrf24l01 = "glasgow.applet.radio.nrf24l01:RadioNRF24L01Applet"
 
 [project.entry-points."glasgow.applet.tool"]
+memory-25q = "glasgow.applet.memory._25q.decode:Memory25QAppletTool"
 memory-25x = "glasgow.applet.memory._25x.decode:Memory25xAppletTool"
 memory-prom = "glasgow.applet.memory.prom:MemoryPROMAppletTool"
 memory-floppy = "glasgow.applet.memory.floppy:MemoryFloppyAppletTool [numpy]"
@@ -181,5 +202,16 @@ build-backend = "pdm.backend"
 # Development workflow configuration
 
 [tool.pdm.scripts]
-"update-pdm.min.lock".cmd = "pdm lock -L pdm.min.lock -S direct_minimal_versions"
 test.cmd = "python -m unittest"
+repl.cmd = "python -m asyncio"
+
+# Lockfile with minimal versions. Used to ensure that we do not accidentally depend on functionality
+# available in the latest versions of our dependencies, but not the entire version set.
+# Note the use of `direct_minimal_versions`; `minimal_versions` exists but is too broken to use
+# in practice, as our transitive dependencies often do not test their code in the same way.
+"update-pdm.min.lock".cmd = "pdm lock -L pdm.min.lock -S direct_minimal_versions"
+
+# Lockfile with distribution wheel set. Used to build a Windows .msi installer. Wheels in this
+# lockfile are expected to cross-compile to win32/win_amd64 with MinGW (this implies that they must
+# be using setuptools). It also excludes the builtin toolchain, as a native one is cross-compiled.
+"update-pdm.dist.lock".cmd = "pdm lock -L pdm.dist.lock"

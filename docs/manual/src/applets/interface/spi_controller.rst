@@ -13,6 +13,8 @@ CLI reference
 API reference
 -------------
 
-.. todo::
+.. module:: glasgow.applet.interface.spi_controller
 
-    Add API documentation for ``spi-controller``.
+.. autoexception:: SPIControllerError
+
+.. autoclass:: SPIControllerInterface

@@ -1,9 +1,10 @@
-import logging
+import unittest
 
 from amaranth import *
 from amaranth.lib import io
 from amaranth.sim import Simulator
 
+from glasgow.support import logging
 from glasgow.simulation.assembly import SimulationAssembly
 from glasgow.gateware.ports import PortGroup
 from glasgow.gateware.stream import stream_get
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class QSPIAnalyzerAppletTestCase(GlasgowAppletV2TestCase, applet=QSPIAnalyzerApplet):
+    @unittest.skip("https://github.com/YosysHQ/nextpnr/issues/1753")
     @synthesis_test
     def test_build(self):
         self.assertBuilds()

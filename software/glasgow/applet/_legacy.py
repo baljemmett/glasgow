@@ -26,6 +26,7 @@ __all__ = [
 
 class GlasgowApplet(metaclass=ABCMeta):
     preview = False
+    deprecated = False
     help = "applet help missing"
     description = "applet description missing"
     required_revision = "A0"
@@ -162,7 +163,7 @@ class GlasgowAppletTestCase(unittest.TestCase):
 
     async def run_hardware_applet(self, mode):
         if mode == "record":
-            await self.device.download_target(self.target.build_plan())
+            await self.device.download_plan(self.target.build_plan())
 
         return await self.applet.run(self.device, self._parsed_args)
 
@@ -198,7 +199,7 @@ def applet_hardware_test(setup="run_hardware_applet", args=[]):
         @functools.wraps(case)
         def wrapper(self):
             fixture_path = os.path.join(os.path.dirname(case.__code__.co_filename), "fixtures",
-                                        case.__name__ + ".json")
+                                        case.__name__ + ".jsonl")
             os.makedirs(os.path.dirname(fixture_path), exist_ok=True)
             if os.path.exists(fixture_path):
                 fixture = open(fixture_path)

@@ -1,10 +1,10 @@
-import logging
 import struct
 
 from amaranth import *
 from amaranth.lib import enum, data, wiring, stream
 from amaranth.lib.wiring import In, Out
 
+from glasgow.support import logging
 from glasgow.support.logging import dump_hex
 from glasgow.support.endpoint import ServerEndpoint
 from glasgow.gateware.stream import StreamBuffer
@@ -113,7 +113,7 @@ class JTAGXVCComponent(wiring.Component):
         m.submodules.xvc_probe = xvc_probe = JTAGXVCProbe(self._ports)
         m.d.comb += xvc_probe.divisor.eq(self.divisor)
 
-        m.submodules.buffer = buffer = StreamBuffer(xvc_probe.i_stream.p.shape())
+        m.submodules.buffer = buffer = StreamBuffer.shaped_like(xvc_probe.i_stream)
         wiring.connect(m, xvc_probe.i_stream, buffer.o)
 
         count = Signal(16)

@@ -1,20 +1,23 @@
 import asyncio
-import logging
 
-from glasgow.applet.memory._25x import Memory25xApplet
+from glasgow.support import logging
+from glasgow.applet.memory._25q import Memory25QApplet
 from glasgow.applet.control.gpio import GPIOInterface
 
 
-class ProgramICE40FlashApplet(Memory25xApplet):
+__all__ = ["ProgramICE40FlashApplet"]
+
+
+class ProgramICE40FlashApplet(Memory25QApplet):
     logger = logging.getLogger(__name__)
-    help = "program 25-series Flash memories used with iCE40 FPGAs"
+    help = "program 25-series SPI NOR Flash memories used with iCE40 FPGAs"
     description = """
-    Program the 25-series Flash memories found on many boards with iCE40 FPGAs. This applet is
-    based on the `memory-25x` applet; in addition, it asserts the FPGA reset while programming
+    Program the 25-series SPI NOR Flash memories found on many boards with iCE40 FPGAs. This applet
+    is based on the `memory-25q` applet; in addition, it asserts the FPGA reset while programming
     the memory, and checks the CDONE pin to determine whether the FPGA has successfully read
     the configuration after the applet finishes.
 
-    See the description of the `memory-25x` applet for details.
+    See the description of the `memory-25q` applet for details.
     """
 
     @classmethod
@@ -27,9 +30,11 @@ class ProgramICE40FlashApplet(Memory25xApplet):
     def build(self, args):
         super().build(args)
 
-        self._reset_iface = GPIOInterface(self.logger, self.assembly, pins=(~args.reset,))
+        self._reset_iface = GPIOInterface(self.logger, self.assembly,
+            pins=(~args.reset,), name="reset")
         if args.done is not None:
-            self._done_iface = GPIOInterface(self.logger, self.assembly, pins=(args.done,))
+            self._done_iface = GPIOInterface(self.logger, self.assembly,
+                pins=(args.done,), name="done")
         else:
             self._done_iface = None
 

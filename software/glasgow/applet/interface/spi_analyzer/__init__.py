@@ -1,10 +1,10 @@
 import sys
-import logging
 import argparse
 from amaranth import *
 from amaranth.lib import data, wiring, stream, io, cdc
 from amaranth.lib.wiring import Out
 
+from glasgow.support import logging
 from glasgow.support.logging import dump_hex
 from glasgow.gateware.stream import AsyncQueue
 from glasgow.gateware import cobs
@@ -64,8 +64,7 @@ class SPIAnalyzerFrontend(wiring.Component):
         m.domains.fifo = cd_fifo = ClockDomain(reset_less=True, local=True)
         m.d.comb += cd_fifo.clk.eq(sck_buffer.i)
 
-        m.submodules.fifo = fifo = AsyncQueue(
-            shape=self.stream.p.shape(),
+        m.submodules.fifo = fifo = AsyncQueue.shaped_like(self.stream,
             depth=4, # CDC only, no buffering
             i_domain="fifo",
             o_domain="sync"
@@ -205,6 +204,9 @@ class SPIAnalyzerInterface:
             When the FPGA buffer overflows. The last few transactions before the overflow occurred
             may be dropped as well.
         """
+        if await self._overflow:
+            raise SPIAnalyzerOverflow("overflow")
+
         packet = cobs.decode((await self._pipe.recv_until(b"\0"))[:-1])
         chip, copi_data, cipo_data = packet[0], packet[1::2], packet[2::2]
         self._log("capture chip=%d copi=<%s> cipo=<%s>",
@@ -236,7 +238,7 @@ class SPIAnalyzerApplet(GlasgowAppletV2):
     * ``<CS>,<COPI>,<CIPO>``, where <CS> is a 0-based CS# pin index and <COPI> and <CIPO> are
       the same as above; this format is used if multiple CS# pins are provided.
 
-    If your DUT is a 25-series SPI Flash memory, use the `tool memory-25x` to extract data
+    If your DUT is a 25-series SPI Flash memory, use the `tool memory-25q` to extract data
     from capture files. If quad-IO commands are in use, use the `qspi-analyzer` applet to
     capture data.
     """

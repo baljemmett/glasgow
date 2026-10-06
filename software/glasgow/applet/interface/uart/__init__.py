@@ -1,18 +1,22 @@
+from collections.abc import Buffer
 from typing import Literal
 import os
 import sys
-import logging
 import asyncio
+import argparse
 from amaranth import *
 from amaranth.lib import wiring, stream
 from amaranth.lib.wiring import In, Out
 
+from glasgow.support import logging
 from glasgow.support.arepl import AsyncInteractiveConsole as AsyncInteractiveConsole
 from glasgow.support.logging import dump_hex
 from glasgow.support.endpoint import ServerEndpoint
+from glasgow.support.progress import Progress
+from glasgow.protocol.ymodem import YModemTransport, YModemProtocol, YModemFile, YModemError
 from glasgow.gateware.uart import UART
 from glasgow.abstract import AbstractAssembly, GlasgowPin
-from glasgow.applet import GlasgowAppletV2
+from glasgow.applet import GlasgowAppletV2, GlasgowAppletError
 
 
 class UARTAutoBaud(wiring.Component):
@@ -95,6 +99,7 @@ class UARTAutoBaud(wiring.Component):
 class UARTComponent(wiring.Component):
     i_stream:   In(stream.Signature(8))
     o_stream:   Out(stream.Signature(8))
+    o_flush:    Out(1)
 
     use_auto:   In(1)
     manual_cyc: In(20)
@@ -104,9 +109,10 @@ class UARTComponent(wiring.Component):
     rx_errors:   Out(16)
     rx_overflow: Out(16)
 
-    def __init__(self, ports, *, parity: str):
+    def __init__(self, ports, *, parity: str, stop_bits: int):
         self.ports  = ports
         self.parity = parity
+        self.stop_bits = stop_bits
 
         super().__init__()
 
@@ -118,10 +124,12 @@ class UARTComponent(wiring.Component):
         # the UART to use lib.wiring
         m.submodules.uart = uart = UART(self.ports,
             bit_cyc=(1 << len(self.manual_cyc)) - 1,
-            parity=self.parity)
+            parity=self.parity,
+            stop_bits=self.stop_bits)
         m.submodules.auto_baud = auto_baud = UARTAutoBaud()
 
-        m.d.comb += auto_baud.rx.eq(uart.bus.rx_i)
+        if self.ports.rx is not None:
+            m.d.comb += auto_baud.rx.eq(uart.bus.rx_i)
         m.d.comb += self.auto_cyc.eq(auto_baud.cyc)
 
         with m.If(self.use_auto):
@@ -144,6 +152,7 @@ class UARTComponent(wiring.Component):
             self.o_stream.payload.eq(uart.rx_data),
             self.o_stream.valid.eq(uart.rx_rdy),
             uart.rx_ack.eq(self.o_stream.ready),
+            self.o_flush.eq(uart.rx_ack & uart.rx_data.matches(0x0A, 0x0D)),
         ]
 
         return m
@@ -152,14 +161,17 @@ class UARTComponent(wiring.Component):
 class UARTInterface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
                  rx: GlasgowPin | None, tx: GlasgowPin | None,
-                 parity: Literal["none", "zero", "one", "odd", "even"] = "none"):
+                 parity: Literal["none", "zero", "one", "odd", "even"] = "none",
+                 stop_bits: int = 1):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
         ports = assembly.add_port_group(rx=rx, tx=tx)
-        assembly.use_pulls({rx: "high"})
-        component = assembly.add_submodule(UARTComponent(ports, parity=parity))
-        self._pipe = assembly.add_inout_pipe(component.o_stream, component.i_stream)
+        if rx is not None:
+            assembly.use_pulls({rx: "high"})
+        component = assembly.add_submodule(UARTComponent(ports, parity=parity, stop_bits=stop_bits))
+        self._pipe = assembly.add_inout_pipe(component.o_stream, component.i_stream,
+            in_flush=component.o_flush)
         self._use_auto   = assembly.add_rw_register(component.use_auto)
         self._manual_cyc = assembly.add_rw_register(component.manual_cyc)
         self._auto_cyc   = assembly.add_ro_register(component.auto_cyc)
@@ -228,7 +240,7 @@ class UARTInterface:
             buffer += await self.read(1)
         return memoryview(buffer)
 
-    async def write(self, data: bytes | bytearray | memoryview, *, flush=False):
+    async def write(self, data: Buffer, *, flush=False):
         """Buffers bytes to be transmitted. Until :meth:`flush` is called, bytes are not guaranteed
         to be transmitted (they may or may not be).
         """
@@ -242,6 +254,10 @@ class UARTInterface:
         """Transmits all buffered bytes from the UART."""
         self._log("tx flush")
         await self._pipe.flush()
+
+    def ymodem_transport(self) -> YModemTransport:
+        """Creates an XMODEM/YMODEM transport for the UART."""
+        return _YModemTransportUART(self)
 
     async def monitor(self, *, interval=1.0):
         """Logs receive errors and automatic baud rate changes."""
@@ -271,14 +287,34 @@ class UARTInterface:
             await asyncio.sleep(interval)
 
 
+class _YModemTransportUART(YModemTransport):
+    def __init__(self, lower: UARTInterface):
+        self.lower = lower
+
+    async def recv(self, length: int) -> bytes:
+        return bytes(await self.lower.read(length, flush=False))
+
+    async def send(self, data: bytes):
+        await self.lower.write(data, flush=True)
+
+    async def purge(self):
+        await self.lower.flush()
+        try:
+            # Use a large timeout to give old systems enough time to (re)initialize.
+            while await asyncio.wait_for(self.lower.read_all(flush=False), timeout=1.0):
+                pass
+        except TimeoutError:
+            pass
+
+
 class UARTApplet(GlasgowAppletV2):
     logger = logging.getLogger(__name__)
     help = "communicate via UART"
     description = """
     Transmit and receive data via UART.
 
-    Any baud rate is supported. Only 8 data bits and 1 stop bits are supported, with configurable
-    parity.
+    Any baud rate is supported. Only 8 data bits and from 1 to 8 integer stop bits are supported,
+    with configurable parity.
 
     The automatic baud rate determination algorithm works by locking onto the shortest bit time in
     the receive stream. It will determine the baud rate incorrectly in presence of glitches as well
@@ -297,12 +333,15 @@ class UARTApplet(GlasgowAppletV2):
             "--parity", metavar="PARITY",
             choices=("none", "zero", "one", "odd", "even"), default="none",
             help="send and receive parity bit as PARITY (default: %(default)s)")
+        parser.add_argument(
+            "--stop-bits", metavar="STOP_BITS", choices=(range(1, 9)), type=int, default=1,
+            help="send and receive stop bits as STOP_BITS (default: %(default)s, options: 1..8)")
 
     def build(self, args):
         with self.assembly.add_applet(self):
             self.assembly.use_voltage(args.voltage)
             self.uart_iface = UARTInterface(self.logger, self.assembly,
-                rx=args.rx, tx=args.tx, parity=args.parity)
+                rx=args.rx, tx=args.tx, parity=args.parity, stop_bits=args.stop_bits)
 
     @classmethod
     def add_setup_arguments(cls, parser):
@@ -334,6 +373,42 @@ class UARTApplet(GlasgowAppletV2):
         p_socket = p_operation.add_parser(
             "socket", help="connect UART to a socket")
         ServerEndpoint.add_argument(p_socket, "endpoint")
+
+        def add_command_argument(parser):
+            parser.add_argument(
+                "-c", "--command", metavar="TEXT", type=str, default="",
+                help="send `TEXT<LF>` before transferring data")
+
+        p_xmodem_recv = p_operation.add_parser(
+            "xmodem-recv", help="receive a file using the XMODEM protocol")
+        add_command_argument(p_xmodem_recv)
+        p_xmodem_recv.add_argument(
+            "file", metavar="FILENAME", type=argparse.FileType("wb"),
+            help="write data to FILENAME")
+
+        p_xmodem_send = p_operation.add_parser(
+            "xmodem-send", help="send a file using the XMODEM protocol")
+        add_command_argument(p_xmodem_send)
+        p_xmodem_send.add_argument(
+            "file", metavar="FILENAME", type=argparse.FileType("rb"),
+            help="read data from FILENAME")
+
+        p_ymodem_recv = p_operation.add_parser(
+            "ymodem-recv", help="receive a batch of files using the YMODEM protocol")
+        add_command_argument(p_ymodem_recv)
+        p_ymodem_recv.add_argument(
+            "basename", metavar="BASENAME", type=str, nargs="?",
+            help="write file(s) to BASENAME (or BASENAME-0, BASENAME-1, ...)")
+        p_ymodem_recv.add_argument(
+            "--accept-filenames", default=False, action="store_true",
+            help="accept sender-provided filenames (SECURITY RISK)")
+
+        p_ymodem_send = p_operation.add_parser(
+            "ymodem-send", help="send a batch of files using the YMODEM protocol")
+        add_command_argument(p_ymodem_send)
+        p_ymodem_send.add_argument(
+            "filenames", metavar="FILENAME", type=str, nargs="+",
+            help="read file(s) FILENAME...")
 
     async def _forward_fd(self, in_fileno, out_fileno, *, stream=False):
         async def forward_out():
@@ -425,15 +500,97 @@ class UARTApplet(GlasgowAppletV2):
             group.create_task(forward_in())
 
     async def run(self, args):
-        match args.operation:
-            case None:
-                await self._run_tty(stream=False)
-            case "tty":
-                await self._run_tty(stream=args.stream)
-            case "pty":
-                await self._run_pty()
-            case "socket":
-                await self._run_socket(args.endpoint)
+        try:
+            match args.operation:
+                case None:
+                    await self._run_tty(stream=False)
+                case "tty":
+                    await self._run_tty(stream=args.stream)
+                case "pty":
+                    await self._run_pty()
+                case "socket":
+                    await self._run_socket(args.endpoint)
+
+                case "xmodem-recv":
+                    transport = self.uart_iface.ymodem_transport()
+                    if args.command:
+                        await self.uart_iface.write(f"{args.command}\n".encode())
+                        await transport.purge()
+
+                    with Progress(action="receiving", item="B", scale=1024) as progress:
+                        protocol = YModemProtocol(transport, progress=progress, logger=self.logger)
+                        data = await protocol.recv_single()
+
+                    args.file.write(data)
+                    args.file.flush()
+
+                case "xmodem-send":
+                    data = args.file.read()
+
+                    transport = self.uart_iface.ymodem_transport()
+                    if args.command:
+                        await self.uart_iface.write(f"{args.command}\n".encode())
+                        await transport.purge()
+
+                    with Progress(action="sending", item="B", scale=1024,
+                            total=len(data)) as progress:
+                        protocol = YModemProtocol(transport, progress=progress, logger=self.logger)
+                        await protocol.send_single(data)
+
+                case "ymodem-recv":
+                    if args.basename is None and not args.accept_filenames:
+                        raise GlasgowAppletError(
+                            "neither basename nor --accept-filenames specified")
+
+                    transport = self.uart_iface.ymodem_transport()
+                    if args.command:
+                        await self.uart_iface.write(f"{args.command}\n".encode())
+                        await transport.purge()
+
+                    with Progress(action="receiving", item="B", scale=1024) as progress:
+                        protocol = YModemProtocol(transport, progress=progress, logger=self.logger)
+                        files = await protocol.recv_batch()
+
+                    def write_file(file: YModemFile, filename: str | None = None):
+                        pathname = file.info.pathname.decode(errors="replace")
+                        if filename is None:
+                            filename = pathname
+                            self.logger.info("writing %r", filename)
+                        else:
+                            self.logger.info("writing %r to %r", pathname, filename)
+
+                        with open(filename, "wb") as f:
+                            f.write(file.data)
+
+                    def write_files(files: list[YModemFile]):
+                        if args.basename and len(files) == 1:
+                            write_file(files[0], args.basename)
+                        elif args.basename:
+                            for index, file in enumerate(files):
+                                write_file(file, f"{args.basename}-{index}")
+                        elif args.accept_filenames:
+                            for file in files:
+                                write_file(file)
+                        else:
+                            assert False
+
+                    write_files(files)
+
+                case "ymodem-send":
+                    batch = [YModemFile.from_path(filename) for filename in args.filenames]
+
+                    transport = self.uart_iface.ymodem_transport()
+                    if args.command:
+                        await self.uart_iface.write(f"{args.command}\n".encode())
+                        await transport.purge()
+
+                    with Progress(action="sending", item="B", scale=1024,
+                            total=sum(file.info.length for file in batch)) as progress:
+                        protocol = YModemProtocol(transport, progress=progress, logger=self.logger)
+                        await protocol.send_batch(batch)
+
+        except YModemError as e:
+            raise GlasgowAppletError(str(e))
 
     @classmethod
     def tests(cls):

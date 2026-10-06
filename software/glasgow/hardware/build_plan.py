@@ -1,7 +1,6 @@
 from typing import Never, BinaryIO
 import os
 import sys
-import logging
 import hashlib
 import pathlib
 import tempfile
@@ -11,7 +10,8 @@ from asyncio import subprocess
 import platformdirs
 from amaranth.build.run import BuildPlan
 
-from .toolchain import Toolchain
+from glasgow.support import logging
+from glasgow.hardware.toolchain import Toolchain
 
 
 __all__ = ["GlasgowBuildPlan"]
@@ -25,14 +25,15 @@ class GatewareBuildError(Exception):
 
 
 class GlasgowBuildPlan:
-    def __init__(self, inner: BuildPlan, toolchain: Toolchain):
-        self._inner     = inner
-        self._toolchain = toolchain
+    def __init__(self, inner: BuildPlan, toolchain: Toolchain, product_name: str):
+        self._inner        = inner
+        self._toolchain    = toolchain
+        self._product_name = product_name
 
         hasher = hashlib.blake2s()
         hasher.update(self._inner.digest())
         hasher.update(self._toolchain.identifier)
-        self._bitstream_id = hasher.digest()[:16]
+        self._bitstream_id = hasher.digest()[:8]
 
     @property
     def rtlil(self) -> str:
@@ -86,6 +87,8 @@ class GlasgowBuildPlan:
                 # - APPDATA: required for YoWASP (used by pip executable stub)
                 for var in ("PROCESSOR_ARCHITECTURE", "SYSTEMROOT", "APPDATA"):
                     environ[var] = os.environ[var]
+                # Required for the Yosys abc9 pass to work.
+                environ["TEMP"] = build_dir
 
             # collect stdout (so that it can be reproduced if a log for a cached bitstream is
             # requested later) and also log it with the appropriate level
@@ -99,7 +102,7 @@ class GlasgowBuildPlan:
             if await process.wait():
                 self._report_build_failure(stdout_lines, process.returncode)
 
-            bitstream_data = (pathlib.Path(build_dir) / "top.bin").read_bytes()
+            bitstream_data = (pathlib.Path(build_dir) / self._product_name).read_bytes()
             stdout_data = b"".join(stdout_lines)
         except:
             if debug:

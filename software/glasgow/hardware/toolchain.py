@@ -1,26 +1,33 @@
-from typing import Any
+from typing import Any, Self, Literal, overload
 from collections.abc import Iterator
 from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass
 import re
 import os
 import sys
-import logging
 import hashlib
+import pathlib
 import shutil
 import subprocess
 import importlib.metadata
+import importlib.resources
 import sysconfig
 
-from ..support.lazy import lazy
+from glasgow.support import logging
+from glasgow.support.lazy import lazy
 
 
-__all__ = ["ToolchainNotFound", "Toolchain", "find_toolchain"]
+__all__ = ["ToolchainNotFound", "ToolOutOfDate", "Toolchain", "find_toolchain"]
 
 
 logger = logging.getLogger(__name__)
 
 
 class ToolchainNotFound(Exception):
+    pass
+
+
+class ToolOutOfDate(Exception):
     pass
 
 
@@ -135,7 +142,12 @@ class WasmTool(Tool):
         # Running Wasm tools for the first time can incur a significant delay, so use
         # the version from the Python package metadata (which is guaranteed to be the same).
         # This makes querying the version at least as fast as for the native tools.
-        return (*importlib.metadata.version(self.python_package).split("."),)
+        a, b, _c, *d = importlib.metadata.version(self.python_package).split(".")
+        # This is a bit of a mess. In practice, the third component of the Wasm tool version
+        # doesn't correspond to anything useful for versions we care about, so skip it to make
+        # native and Wasm tools return more or less the same version. The last component is
+        # the git commit distance, which is vital for properly handling pre-release packages.
+        return (a, b, *d)
 
     @property
     def identifier(self) -> bytes | None:
@@ -210,10 +222,25 @@ class SystemTool(Tool):
                     yield os.path.join(root, file)
 
         if self.name == "yosys":
+            # In the odd case of `GLASGOW_TOOLCHAIN=system YOSYS=yowasp-yosys` (which does still
+            # happen), we can't access importlib metadata. However, the version should never be
+            # the same for two different builds, so we don't have to hash data files.
+            if self.command.endswith("yowasp-yosys"):
+                return iter([])
+            # Check if we're dealing with an installed Yosys binary, where the share files
+            # are co-located in the same prefix. Sometimes the share directory path will be
+            # baked into Yosys and sometimes it will be referenced to /proc/self/exe, but
+            # the result is the same.
+            yosys_prefix = pathlib.Path(self.command).parent.parent
+            yosys_datdir = yosys_prefix.joinpath("share", "yosys")
+            if yosys_datdir.exists:
+                return iter_files(yosys_datdir)
+            # If we have `yosys-config`, this is probably a development version of Yosys. If not,
+            # we don't have any way to hash the data directory, and continuing is unsafe.
             if yosys_datdir := self.get_output([f"{self.command}-config", "--datdir"]):
                 return iter_files(yosys_datdir)
             else:
-                return None
+                raise FileNotFoundError("could not find Yosys data directory")
         else:
             # It is unclear if it is feasible to get at the data files and other dependencies
             # for nextpnr. However, while it is possible to ship chipdb separately (and Wasm
@@ -227,7 +254,6 @@ class SystemTool(Tool):
 
     _identifier_cache: str | None = None
 
-    # To the Nix person who replaces this with something more sensible: please message @whitequark
     @property
     def identifier(self) -> bytes | None:
         if not self.available:
@@ -286,6 +312,58 @@ class JsTool(Tool):
         return hasher.digest()[:16]
 
 
+@dataclass
+class _NixPackage:
+    name:    str
+    version: tuple[str, ...]
+    command: str
+
+    @classmethod
+    def parse(cls) -> dict[str, Self]:
+        with importlib.resources.files(__package__).joinpath("toolchain_nix.txt").open() as f:
+            packages = []
+            for line in f.readlines():
+                if m := re.match(r"^\s*(#.*)?$", line):
+                    pass # whitespace or comment only
+                elif m := re.match(r"^\s*(\S+)\s+(\S+)\s+(\S+)\s*(#.*)?$", line):
+                    packages.append(cls(name=m[1], version=tuple(m[2].split(".")), command=m[3]))
+                else:
+                    assert False, f"invalid toolchain_nix.txt syntax: {line!r}"
+            return {package.name: package for package in packages}
+
+
+class NixTool(Tool):
+    _STORE = _NixPackage.parse()
+
+    @property
+    def available(self) -> bool:
+        return self.package_name in self._STORE
+
+    @property
+    def command(self) -> str | None:
+        if package := self._STORE[self.package_name]:
+            return package.command
+        else:
+            return None
+
+    @property
+    def version(self) -> tuple[str, ...] | None:
+        if package := self._STORE[self.package_name]:
+            return package.version
+        else:
+            return None
+
+    @property
+    def identifier(self) -> tuple[str, ...] | None:
+        if package := self._STORE[self.package_name]:
+            # The store path uniquely identifies a specific build of the tool.
+            hasher = hashlib.blake2s()
+            hasher.update(package.command.encode("utf-8"))
+            return hasher.digest()[:16]
+        else:
+            return None
+
+
 class Toolchain:
     def __init__(self, tools):
         self.tools = list(tools)
@@ -342,6 +420,18 @@ class Toolchain:
             hasher.update(tool.identifier)
         return hasher.digest()[:16]
 
+    def assert_version(self, tool: str, required: tuple[str, ...]):
+        # This is pretty janky, but unfortunately we don't have a clean way to implement this.
+        def comparable(version: tuple[str, ...]):
+            return [int(chunk) for chunk in version[:len(required)]]
+        assert comparable(("0", "9")) < comparable(("0", "91"))
+
+        versions = self.versions
+        if tool in versions and comparable(versions[tool]) < comparable(required):
+            raise ToolOutOfDate(
+                f"tool {tool!r} is out of date: installed version {'.'.join(versions[tool])} "
+                f"is older than required version {'.'.join(required)}")
+
     def __str__(self) -> str:
         return ", ".join(f"{name} {'.'.join(ver or ('(unavailable)',))}"
                          for name, ver in self.versions.items())
@@ -353,7 +443,15 @@ class Toolchain:
                 f">")
 
 
-def find_toolchain(tools=("yosys", "nextpnr-ice40", "icepack"), *, quiet=False):
+_ALL_TOOLS = ["yosys", "nextpnr-ice40", "icepack", "nextpnr-ecp5", "ecppack"]
+
+
+@overload
+def find_toolchain(tools=_ALL_TOOLS, *, quiet: Literal[True]) -> Toolchain | None:
+    pass
+
+
+def find_toolchain(tools=_ALL_TOOLS, *, quiet: Literal[False] = False) -> Toolchain:
     """Discover a toolchain.
 
     Returns a :class:`Toolchain` that includes all of the requested tools chosen according to
@@ -365,6 +463,7 @@ def find_toolchain(tools=("yosys", "nextpnr-ice40", "icepack"), *, quiet=False):
     if sys.platform == "emscripten":
         available_toolchains["js"]      = Toolchain(map(JsTool,     tools))
     else:
+        available_toolchains["nix"]     = Toolchain(map(NixTool,    tools))
         available_toolchains["builtin"] = Toolchain(map(WasmTool,   tools))
         available_toolchains["system"]  = Toolchain(map(SystemTool, tools))
 

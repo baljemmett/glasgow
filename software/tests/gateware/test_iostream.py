@@ -74,8 +74,9 @@ class IOStreamerTestCase(unittest.TestCase):
 
         ports = PortGroup()
         data_width = 8
-        ports.data_out = io.SimulationPort("o", data_width)
-        ports.data_in  = io.SimulationPort("i", data_width)
+        ports.data_out   = io.SimulationPort("o", data_width)
+        ports.data_in    = io.SimulationPort("i", data_width)
+        ports.zero_width = None
 
         CLOCK_PERIOD = 1e-6
 
@@ -96,9 +97,6 @@ class IOStreamerTestCase(unittest.TestCase):
         data_to_receive = [first_data_to_receive] + data_to_send[:-1]
         meta_to_send = [random.randrange(1 << data_width) for _ in range(active_cycles)]
 
-        expected_sample = []
-        actually_sampled = []
-
         async def o_stream_consumer_tb(ctx):
             meta_index = data_index = 0
             for o_ready_bit in o_ready_bits:
@@ -109,7 +107,7 @@ class IOStreamerTestCase(unittest.TestCase):
                         meta_index += 1
                         for j in range(ratio):
                             assert payload.port.data_in.i[j] == data_to_receive[data_index], \
-                                "Wrong data received (index,actual,expecred) = " + \
+                                "Wrong data received (index,actual,expected) = " + \
                                 f"{j},0x{payload.port.data_in.i[j]:02x},0x{data_to_receive[data_index]:02x}"
                             data_index += 1
                 else:

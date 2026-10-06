@@ -9,7 +9,7 @@
 
 src = ["glasgow", "tests"]
 line-length = 100
-target-version = "py311"
+target-version = "py313"
 
 [lint]
 preview = true
@@ -197,8 +197,14 @@ allow-dict-calls-with-keyword-arguments = true
 "glasgow/arch/*" = ["E302", "E305"] # blank-lines-top-level, blank-lines-after-function-or-class
 
 # Databases don't have to be formatted well.
-"glasgow/database/*" = ["E501"] # line-too-long
+"glasgow/database/*" = ["E501", "FURB192", "Q000"] # line-too-long, sorted-min-max
 
 # These modules use cursed import hacks for backward compatibility.
 "glasgow/applet/__init__.py" = ["E402"] # module-import-not-at-top-of-file
 "glasgow/gateware/ports.py" = ["E402"] # module-import-not-at-top-of-file
+
+# These ones use cursed import hacks for a nicer API.
+"glasgow/gateware/pll/__init__.py" = ["E402"]
+
+# Very high false positive ratio.
+"glasgow/**/test.py" = ["B023"] # function-uses-loop-variable

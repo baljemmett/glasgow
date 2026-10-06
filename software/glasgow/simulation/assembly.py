@@ -1,16 +1,20 @@
-from typing import Any
-from collections.abc import Generator
+from typing import Any, override
+from collections.abc import Buffer, Generator
 from contextlib import contextmanager
-import logging
+import dataclasses
 
 from amaranth import *
-from amaranth.lib import io
+from amaranth.lib import io, wiring
 from amaranth.sim import Simulator
 
-from ..abstract import *
+from glasgow.support import logging
+from glasgow.abstract import (AbstractAssembly, AbstractInOutPipe, AbstractInPipe, AbstractOutPipe,
+                              AbstractRORegister, AbstractRWRegister,
+                              DRAMOptions, GlasgowPin, GlasgowPort, GlasgowVio, PullState)
+from glasgow.gateware import octoram
 
 
-__all__ = ["SimulationPipe", "SimulationRegister", "SimulationAssembly"]
+__all__ = ["SimulationPipe", "SimulationRORegister", "SimulationRWRegister", "SimulationAssembly"]
 
 
 logger = logging.getLogger(__name__)
@@ -50,7 +54,7 @@ class SimulationPipe(AbstractInOutPipe):
     def writable(self) -> int | None:
         return None
 
-    async def send(self, data: bytes | bytearray | memoryview):
+    async def send(self, data: Buffer):
         assert self._o_buffer is not None, "send() called on an in pipe"
         self._o_buffer.extend(data)
 
@@ -90,18 +94,20 @@ class SimulationAssembly(AbstractAssembly):
     def __init__(self):
         self._logger   = logger
         self._pins     = {} # {name: io.PortLike}
+        self._leds     = {} # {name: Signal}
         self._modules  = [] # (elaboratable, name)
         self._benches  = [] # (constructor, background)
         self._jumpers  = [] # (pin_name...)
+        self._memories = 0
         self.__context = None
 
     @property
-    def sys_clk_period(self) -> "Period":
+    def sys_clk_period(self) -> float: # TODO: migrate to `amaranth.hdl.Period`
         # Reduced from 36 or 48 MHz to 1 MHz to improve test performance.
         return 1/1000000
 
     @contextmanager
-    def add_applet(self, applet: Any) -> Generator[None, None, None]:
+    def add_applet(self, applet: Any) -> Generator[None]:
         self._logger = applet.logger
         try:
             yield
@@ -116,6 +122,9 @@ class SimulationAssembly(AbstractAssembly):
 
     def get_pin(self, pin_name: str) -> io.SimulationPort:
         return self._pins[pin_name]
+
+    def get_led(self, led_name: str) -> Signal:
+        return self._leds[led_name]
 
     def connect_pins(self, *pin_names: str):
         self._jumpers.append(pin_names)
@@ -141,6 +150,7 @@ class SimulationAssembly(AbstractAssembly):
             i_buffer = bytearray()
             async def i_testbench(ctx):
                 nonlocal i_buffer
+                assert i_buffer is not None
                 timer = 0
                 packet = bytearray()
                 ctx.set(in_stream.ready, 1)
@@ -176,13 +186,35 @@ class SimulationAssembly(AbstractAssembly):
 
         return SimulationPipe(self, i_buffer=i_buffer, o_buffer=o_buffer)
 
+    @override
+    def add_dynamic_memory(self, options=DRAMOptions()) -> tuple[octoram.Signature, range]:
+        if options.size is None:
+            options = dataclasses.replace(options, size=64 * 0x100000)
+        m = Module()
+        m.submodules.ctrl = ctrl = DomainRenamer("dram")(
+            octoram.SimulationController(options.size or 64 * 0x100000))
+        m.submodules.queue = queue = octoram.InterfaceQueue(
+            i_domain="sync",
+            o_domain="dram",
+            w_buffer_depth=options.w_buffer_size,
+            r_buffer_depth=options.r_buffer_size,
+        )
+        wiring.connect(m, queue.o, ctrl.bus)
+        self._modules.append((m, f"mem{self._memories}"))
+        self._benches.append((ctrl.testbench, True)) # background
+        self._memories += 1
+        return queue.i, range(options.size)
+
+    def add_indicator(self, signal: Signal, *, name: str):
+        self._leds[name] = signal
+
     def add_ro_register(self, signal) -> AbstractRORegister:
         return SimulationRORegister(self, signal)
 
     def add_rw_register(self, signal) -> AbstractRWRegister:
         return SimulationRWRegister(self, signal)
 
-    def add_submodule(self, elaboratable, *, name=None) -> Elaboratable:
+    def add_submodule[E: Elaboratable](self, elaboratable: E, *, name: str | None = None) -> E:
         self._modules.append((elaboratable, name))
         return elaboratable
 
@@ -230,7 +262,12 @@ class SimulationAssembly(AbstractAssembly):
             m.submodules[name] = elaboratable
 
         sim = Simulator(m)
-        sim.add_clock(self.sys_clk_period)
+        sim.add_clock(self.sys_clk_period, domain="sync")
+        if self._memories:
+            # Maintain approximately the same frequency ratio between the `sync` and `dram` domains
+            # as on real hardware, without requiring `sync` to run as fast (which causes issues for
+            # applets that involve waiting for a delay).
+            sim.add_clock(self.sys_clk_period / 2.333, domain="dram")
 
         async def wrap_fn(ctx):
             self.__context = ctx

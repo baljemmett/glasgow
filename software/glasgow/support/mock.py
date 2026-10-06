@@ -4,6 +4,9 @@ import sys
 import json
 import inspect
 import unittest
+import dataclasses
+import enum
+import importlib
 
 
 __all__ = ["MockRecorder", "MockReplayer"]
@@ -24,6 +27,11 @@ class MockRecorder:
             return {"__class__": "bytearray", "hex": obj.hex()}
         if isinstance(obj, memoryview):
             return {"__class__": "memoryview", "hex": obj.hex()}
+        qualpath = [type(obj).__module__, type(obj).__qualname__]
+        if isinstance(obj, enum.Enum):
+            return {"__class__": qualpath, "name": obj.name, "value": obj.value}
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return {"__class__": qualpath, **obj.__getstate__()}
         raise TypeError(f"{type(obj)} is not serializable")
 
     def __dump_stanza(self, stanza):
@@ -54,7 +62,7 @@ class MockRecorder:
                     @asynccontextmanager
                     async def cmgr_wrapper():
                         value = await result.__aenter__()
-                        self.__dump_method(attr, "asynccontext.enter", (), {}, value)
+                        self.__dump_method(attr, "asynccontext.enter", args, kwargs, value)
                         try:
                             yield value
                         finally:
@@ -92,7 +100,13 @@ class MockReplayer:
             return bytearray.fromhex(obj["hex"])
         if obj["__class__"] == "memoryview":
             return memoryview(bytes.fromhex(obj["hex"]))
-        assert False
+        modname, clsname = obj.pop("__class__")
+        cls = getattr(importlib.import_module(modname), clsname)
+        if issubclass(cls, enum.Enum):
+            return getattr(cls, obj["name"])
+        if dataclasses.is_dataclass(cls):
+            return cls(**obj)
+        assert False, f"Cannot deserialize {modname}.{clsname}"
 
     def __load(self):
         return json.loads(self.__fixture.readline(), object_hook=self.__load_object)
@@ -115,9 +129,9 @@ class MockReplayer:
         self.__case.assertEqual(attr, stanza["call"])
         if stanza["kind"] == "asynccontext.enter":
             @asynccontextmanager
-            async def mock():
-                assert () == tuple(stanza["args"])
-                assert {} == stanza["kwargs"]
+            async def mock(*args, **kwargs):
+                self.__case.assertEqual(args, tuple(stanza["args"]))
+                self.__case.assertEqual(kwargs, stanza["kwargs"])
                 try:
                     yield stanza["result"]
                 finally:

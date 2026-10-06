@@ -1,3 +1,0 @@
-{"call": "select", "kind": "asynccontext.enter", "args": [], "kwargs": {}, "result": null}
-{"call": "exchange", "kind": "asyncmethod", "args": [[56, 0, 0, 0]], "kwargs": {}, "result": {"__class__": "bytes", "hex": "00380063"}}
-{"call": "select", "kind": "asynccontext.exit", "args": [null], "kwargs": {}, "result": null}

@@ -2,17 +2,20 @@
 # Document Number: UM10204
 # Accession: G00101
 
+from collections.abc import Buffer
 import contextlib
-import logging
 import struct
 
 from amaranth import *
 from amaranth.lib import enum, wiring, stream
 from amaranth.lib.wiring import In, Out
 
+from glasgow.support import logging
 from glasgow.support.logging import dump_hex
 from glasgow.abstract import AbstractAssembly, GlasgowPin, PullState, ClockDivisor
 from glasgow.gateware.i2c import I2CInitiator
+from glasgow.arch.i2c import ProbeStep
+from glasgow.database.i2c.probe import devices as probe_devices
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 
 
@@ -49,6 +52,7 @@ class I2CControllerComponent(wiring.Component):
 
         cmd   = Signal(_Command)
         count = Signal(16)
+        acked = Signal.like(count)
 
         with m.FSM():
             with m.State("IDLE"):
@@ -88,35 +92,38 @@ class I2CControllerComponent(wiring.Component):
                                 m.next = "READ-FIRST"
 
             with m.State("WRITE-FIRST"):
+                m.d.sync += acked.eq(0)
                 with m.If(self.i_stream.valid):
                     m.d.comb += self.i_stream.ready.eq(1)
                     m.d.comb += ctrl.data_i.eq(self.i_stream.payload)
                     m.d.comb += ctrl.write.eq(1)
                     m.next = "WRITE-ACK"
 
+            with m.State("WRITE-NEXT"):
+                with m.If(self.i_stream.valid):
+                    m.d.comb += self.i_stream.ready.eq(1)
+                    with m.If(ctrl.ack_o):
+                        m.d.comb += ctrl.data_i.eq(self.i_stream.payload)
+                        m.d.comb += ctrl.write.eq(1)
+                    m.next = "WRITE-ACK"
+
             with m.State("WRITE-ACK"):
                 with m.If(~ctrl.busy):
+                    m.d.sync += count.eq(count - 1)
                     with m.If(ctrl.ack_o):
-                        m.d.sync += count.eq(count - 1)
-                    m.next = "WRITE"
-
-            with m.State("WRITE"):
-                with m.If((count == 0) | ~ctrl.ack_o):
-                    m.next = "REPORT"
-                with m.Elif(self.i_stream.valid):
-                    m.d.comb += self.i_stream.ready.eq(1)
-                    m.d.comb += ctrl.data_i.eq(self.i_stream.payload)
-                    m.d.comb += ctrl.write.eq(1)
-                    m.next = "WRITE-ACK"
+                        m.d.sync += acked.eq(acked + 1)
+                    with m.If(count > 1):
+                        m.next = "WRITE-NEXT"
+                    with m.Else():
+                        m.next = "REPORT"
 
             with m.State("REPORT"):
                 word = Signal(range(2))
                 m.d.comb += self.o_stream.valid.eq(1)
                 with m.If(self.o_stream.ready):
-                    m.d.comb += self.o_stream.payload.eq(count.word_select(word, 8))
+                    m.d.comb += self.o_stream.payload.eq(acked.word_select(word, 8))
                     m.d.sync += word.eq(word + 1)
                     with m.If(word == 1):
-                        m.d.sync += count.eq(0)
                         m.next = "IDLE"
 
             with m.State("READ-FIRST"):
@@ -165,7 +172,7 @@ class I2CControllerInterface:
     def _log(self, message, *args):
         self._logger.log(self._level, "I²C: " + message, *args)
 
-    async def _command(self, cmd: _Command, *, send: bytes | bytearray, recv: int) -> memoryview:
+    async def _command(self, cmd: _Command, *, send: Buffer, recv: int) -> memoryview:
         await self._pipe.send([cmd.value])
         await self._pipe.send(send)
         await self._pipe.flush()
@@ -189,24 +196,25 @@ class I2CControllerInterface:
             self._log(f"read addr={address:#09b}")
         else:
             self._log(f"write addr={address:#09b}")
-        unacked, = struct.unpack("<H",
+        acked, = struct.unpack("<H",
             await self._command(_Command.Write,
                 send=struct.pack("<HB", 1, (address << 1) | read),
                 recv=2))
-        if unacked:
+        if not acked:
             raise I2CNotAcknowledged(
                 f"address {address:#09b} ({'read' if read else 'write'}) not acknowledged")
 
-    async def _do_write(self, data: bytes | bytearray | memoryview) -> int:
+    async def _do_write(self, data: Buffer) -> int:
         self._log("write data=<%s>", dump_hex(data))
         acked = 0
         for chunk in self._chunked(data):
-            chunk_unacked, = struct.unpack("<H",
+            chunk_acked, = struct.unpack("<H",
                 await self._command(_Command.Write,
                     send=struct.pack("<H", len(chunk)) + bytes(chunk),
                     recv=2))
-            acked += len(chunk) - chunk_unacked
-            if chunk_unacked > 0:
+            self._log("write   acked=%d/%d", chunk_acked, len(chunk))
+            acked += chunk_acked
+            if chunk_acked < len(chunk):
                 raise I2CNotAcknowledged(
                     f"data not acknowledged ({acked}/{len(data)} written)")
 
@@ -269,7 +277,7 @@ class I2CControllerInterface:
                 await self._do_stop()
             self._multi = False
 
-    async def write(self, address: int, data: bytes | bytearray | memoryview):
+    async def write(self, address: int, data: Buffer):
         """Write bytes.
 
         Generates a START condition followed by a WRITE target address (:py:`(address << 1) | 0`),
@@ -362,6 +370,38 @@ class I2CControllerInterface:
         revision     = device_id[2] & 0x7
         return (manufacturer, part_ident, revision)
 
+    async def probe(self, address: int, sequence: list[ProbeStep]) -> bool:
+        """Run a probe sequence.
+
+        Executes the :py:`sequence` against an I²C target at :py:`address`.
+
+        .. danger::
+
+            This is an **inherently dangerous** action. If the device at :py:`address` does not
+            conform to the assumptions used when designing :py:`sequence`, the outcome is
+            unpredictable and may cause damage to the device and/or the assembly it is a part of.
+
+        Returns :py:`True` if the sequence matches, :py:`False` otherwise.
+        """
+        for step in sequence:
+            match step.type:
+                case ProbeStep.Type.Start | ProbeStep.Type.RepStart:
+                    await self._do_start()
+                case ProbeStep.Type.Stop:
+                    await self._do_stop()
+                case ProbeStep.Type.AddrWrite:
+                    await self._do_addr(address, read=False)
+                case ProbeStep.Type.AddrRead:
+                    await self._do_addr(address, read=True)
+                case ProbeStep.Type.DataWrite:
+                    await self._do_write(step.data)
+                case ProbeStep.Type.DataRead:
+                    read = await self._do_read(len(step.data))
+                    for read_byte, data_byte, mask_byte in zip(read, step.data, step.mask):
+                        if read_byte & mask_byte != data_byte:
+                            return False
+        return True
+
 
 class I2CControllerApplet(GlasgowAppletV2):
     logger = logging.getLogger(__name__)
@@ -402,22 +442,52 @@ class I2CControllerApplet(GlasgowAppletV2):
         p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION", required=True)
 
         p_scan = p_operation.add_parser(
-            "scan", help="scan all possible I2C addresses")
+            "scan", help="scan all possible I²C addresses")
         p_scan.add_argument(
             "--device-id", action="store_true", default=False,
             help="read device ID from devices responding to scan")
+        p_scan.add_argument(
+            "--probe", action="store_true", default=False,
+            help="(DANGEROUS) attempt to detect device identity by probing known registers")
+        p_scan.add_argument(
+            "--accept-risk", action="store_true", default=False,
+            help="accept risks inherent in blindly probing I²C devices")
 
     async def run(self, args):
         if args.operation == "scan":
+            if args.probe and not args.accept_risk:
+                self.logger.error("probing I²C devices may cause DANGEROUS consequences")
+                self.logger.error("re-run with --accept-risk to do anyway")
+                return
+            elif args.probe:
+                self.logger.warning("probing I²C devices may cause UNPREDICTABLE consequences")
+                probe_all_matched = True
+
             for addr in await self.i2c_iface.scan():
                 self.logger.info(f"scan found address {addr:#09b}/{addr:#04x}")
+
                 if args.device_id:
                     try:
                         manufacturer, part_ident, revision = await self.i2c_iface.device_id(addr)
-                        self.logger.info("device %s ID: manufacturer %s, part %s, revision %s",
-                            bin(addr), bin(manufacturer), bin(part_ident), bin(revision))
+                        self.logger.info("  device ID: manufacturer %s, part %s, revision %s",
+                            bin(manufacturer), bin(part_ident), bin(revision))
                     except I2CNotAcknowledged:
-                        self.logger.warning("device %s did not acknowledge Device ID", bin(addr))
+                        self.logger.info("  device ID: not acknowledged")
+
+                if args.probe:
+                    probe_matched = False
+                    for probe_device in probe_devices:
+                        if addr in probe_device.addresses:
+                            if await self.i2c_iface.probe(addr, probe_device.sequence):
+                                self.logger.info("  device probe: matches %s", probe_device.name)
+                                probe_matched = True
+                    if not probe_matched:
+                        probe_all_matched = False
+
+            if args.probe and not probe_all_matched:
+                self.logger.info("some probed devices were not found in sequence database")
+                self.logger.info(
+                    "please update software/glasgow/database/i2c/probe.py and send a pull request")
 
     @classmethod
     def tests(cls):

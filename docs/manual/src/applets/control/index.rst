@@ -8,6 +8,9 @@ Device control
 .. toctree::
     :maxdepth: 3
 
+    clock
     gpio
+    mdio
     servo
     si535x
+    tps6598x

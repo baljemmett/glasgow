@@ -52,6 +52,7 @@ class GlasgowAppletError(Exception):
 
 class GlasgowAppletV2(metaclass=ABCMeta):
     preview = False
+    deprecated = False
     help = "applet help missing"
     description = "applet description missing"
     required_revision = "A0"
@@ -65,6 +66,8 @@ class GlasgowAppletV2(metaclass=ABCMeta):
                                     f"use on a rev{assembly.revision} device is unsupported")
             if self.preview:
                 self.logger.warning(f"applet is PREVIEW QUALITY and may CORRUPT DATA")
+            if self.deprecated:
+                self.logger.warning(f"applet is DEPRECATED and WILL BE REMOVED: {self.deprecated}")
 
     @property
     def assembly(self) -> AbstractAssembly:
@@ -108,6 +111,7 @@ class GlasgowAppletV2(metaclass=ABCMeta):
 
     def _code_locals(self, args):
         return {
+            "__name__": "<eval>",
             "asyncio": asyncio,
             "self": self,
             "args": args,
@@ -352,10 +356,10 @@ def applet_v2_hardware_test(*, prepare=None, args=None, mocks: list[str]):
             parsed_args = self._parse_args(args)
             fixture_path = os.path.join(
                 os.path.dirname(case.__code__.co_filename), "fixtures",
-                case.__name__ + ".json")
+                case.__name__ + ".jsonl")
             if not os.path.exists(fixture_path):
                 # Record mode
-                assembly = HardwareAssembly.find_device()
+                assembly = await HardwareAssembly.find_device()
                 applet: GlasgowAppletV2 = self.applet_cls(assembly)
                 applet.build(parsed_args)
                 async with assembly:
@@ -363,7 +367,7 @@ def applet_v2_hardware_test(*, prepare=None, args=None, mocks: list[str]):
                     with open(f"{fixture_path}.new", "w") as fixture:
                         await applet.setup(parsed_args)
                         if prepare is not None:
-                            await prepare(self, assembly)
+                            await prepare(self, applet)
                         for mock in mocks:
                             mock_obj = applet
                             *mock_path, mock_attr = mock.split(".")

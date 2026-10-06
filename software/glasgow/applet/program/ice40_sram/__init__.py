@@ -2,10 +2,11 @@
 # Document Number: FPGA-TN-02001-3.2
 # Accession: G00073
 
+from collections.abc import Buffer
 import argparse
 import asyncio
-import logging
 
+from glasgow.support import logging
 from glasgow.abstract import AbstractAssembly, GlasgowPin, ClockDivisor
 from glasgow.applet.interface.spi_controller import SPIControllerInterface
 from glasgow.applet.control.gpio import GPIOInterface
@@ -27,10 +28,12 @@ class ICE40SRAMInterface:
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
         self._spi_iface = SPIControllerInterface(logger, assembly,
-            cs=cs, sck=sck, copi=copi, mode=3)
-        self._reset_iface = GPIOInterface(logger, assembly, pins=(~reset,))
+            cs=cs, sck=sck, copi=copi)
+        self._reset_iface = GPIOInterface(logger, assembly,
+            pins=(~reset,), name="reset")
         if done is not None:
-            self._done_iface = GPIOInterface(logger, assembly, pins=(done,))
+            self._done_iface = GPIOInterface(logger, assembly,
+                pins=(done,), name="done")
         else:
             self._done_iface = None
 
@@ -42,7 +45,7 @@ class ICE40SRAMInterface:
         """SCK clock divisor."""
         return self._spi_iface.clock
 
-    async def load(self, bitstream: bytes | bytearray | memoryview) -> bool:
+    async def load(self, bitstream: Buffer):
         """Load :py:`bitstream` into configuration SRAM.
 
         Raises
@@ -51,16 +54,18 @@ class ICE40SRAMInterface:
             If the CDONE pin is present and was not asserted within 100 ms after the bitstream
             has been shifted in.
         """
+        # Assert CS# low as RESET# is deasserted to prevent FPGA from attempting to configure
+        # from flash using the same SPI interface.
+        self._log("resetting")
+        await self._spi_iface.synchronize()
+        await self._reset_iface.output(0, True)
+
         async with self._spi_iface.select():
-            self._log("resetting")
-
-            # Assert CS#
+            # Shift a dummy byte to ensure CS# is actually asserted. (This is a property of
+            # the Glasgow SPI controller as of 2026-02-01).
             await self._spi_iface.dummy(1)
-
-            # Pulse reset while holding CS# low; if CS# is not held low as RESET# is deasserted,
-            # the FPGA will try to configure from Flash instead, causing bus contention
             await self._spi_iface.synchronize()
-            await self._reset_iface.output(0, True)
+
             await self._reset_iface.output(0, False)
             await self._spi_iface.synchronize()
 
@@ -69,11 +74,9 @@ class ICE40SRAMInterface:
 
             self._log("programming")
 
-            # Write bitstream
+            # Write bitstream followed by 49 dummy bits (per TN-02001).
             await self._spi_iface.write(bitstream)
-
-            # Specs says at least 49 dummy bits. Send 128.
-            await self._spi_iface.dummy(128)
+            await self._spi_iface.dummy(49)
 
         if self._done_iface is not None:
             self._log("waiting for CDONE")
@@ -94,6 +97,7 @@ class ProgramICE40SRAMApplet(GlasgowAppletV2):
     description = """
     Program the volatile bitstream memory of iCE40 FPGAs.
     """
+    required_revision = "C0"
 
     @classmethod
     def add_build_arguments(cls, parser, access):

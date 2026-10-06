@@ -1,4 +1,3 @@
-
 # Ref: Microchip MEC1618 Low Power 32-bit Microcontroller with Embedded Flash
 # Document Number: DS00002339A
 # Accession: G00005
@@ -6,12 +5,12 @@
 # Document Number: DS00002485A
 # Accession: G00006
 
-import logging
 import argparse
 import struct
 import asyncio
 import textwrap
 
+from glasgow.support import logging
 from glasgow.support.aobject import aobject
 from glasgow.arch.arc import *
 from glasgow.arch.arc.mec16xx import *

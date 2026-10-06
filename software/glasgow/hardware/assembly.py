@@ -1,17 +1,18 @@
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, override
 from collections.abc import Generator
 from collections import defaultdict
 from contextlib import contextmanager
 import os
 import asyncio
-import logging
+import dataclasses
 
 from amaranth import *
 from amaranth.hdl import ShapeCastable
-from amaranth.lib import wiring, io
+from amaranth.lib import wiring, io, cdc
+from amaranth.vendor import SiliconBluePlatform
 from amaranth.build import ResourceError
 
-from ..support import usb
+from ..support import logging
 from ..support.logging import dump_hex
 from ..support.task_queue import TaskQueue
 from ..support.chunked_fifo import ChunkedFIFO
@@ -19,9 +20,11 @@ from ..gateware.i2c import I2CTarget
 from ..gateware.registers import I2CRegisters
 from ..gateware.fx2_crossbar import FX2Crossbar
 from ..gateware.stream import Queue
+from ..gateware import octoram, pll
 from ..abstract import *
 from .platform.rev_ab import GlasgowRevABPlatform
 from .platform.rev_c import GlasgowRevC0Platform, GlasgowRevC123Platform
+from .platform.rev_d import GlasgowRevD0Platform
 from .toolchain import find_toolchain
 from .build_plan import GlasgowBuildPlan
 from .device import GlasgowDevice
@@ -123,9 +126,10 @@ class HardwareInPipe(AbstractInPipe):
         self._logger            = logger
         self._parent            = parent
 
-        self._in_interface      = None # allocated later
-        self._in_ep_address     = None
-        self._in_packet_size    = None
+        self._in_interface      = -1 # allocated later
+        self._in_alt_setting    = 1
+        self._in_ep_address     = -1
+        self._in_packet_size    = -1
 
         self._in_running        = False
         self._in_buffer_size    = buffer_size
@@ -139,8 +143,10 @@ class HardwareInPipe(AbstractInPipe):
 
     async def _start(self):
         assert not self._in_running
-        self._logger.trace(f"IN pipe {self._in_interface}: starting")
-        await self._parent.device.usb_device.select_alternate_interface(self._in_interface, 1)
+        self._logger.trace(f"IN pipe {self._in_interface}: starting "
+            f"(alt-setting {self._in_alt_setting})")
+        await self._parent.device.usb_device.select_alternate_interface(self._in_interface,
+            self._in_alt_setting)
         for _ in range(_xfers_per_queue):
             self._in_tasks.submit(self._in_task())
         self._in_running = True
@@ -251,9 +257,10 @@ class HardwareOutPipe(AbstractOutPipe):
         self._logger            = logger
         self._parent            = parent
 
-        self._out_interface     = None # allocated later
-        self._out_ep_address    = None
-        self._out_packet_size   = None
+        self._out_interface     = -1 # allocated later
+        self._out_alt_setting   = 1
+        self._out_ep_address    = -1
+        self._out_packet_size   = -1
 
         self._out_running       = False
         self._out_buffer_size   = buffer_size
@@ -267,8 +274,10 @@ class HardwareOutPipe(AbstractOutPipe):
 
     async def _start(self):
         assert not self._out_running
-        self._logger.trace(f"OUT pipe {self._out_interface}: starting")
-        await self._parent.device.usb_device.select_alternate_interface(self._out_interface, 1)
+        self._logger.trace(f"OUT pipe {self._out_interface}: starting "
+            f"(alt-setting {self._out_alt_setting})")
+        await self._parent.device.usb_device.select_alternate_interface(self._out_interface,
+            self._out_alt_setting)
         self._out_running = True
 
     async def _stop(self):
@@ -324,11 +333,12 @@ class HardwareOutPipe(AbstractOutPipe):
 
     async def send(self, data):
         if self._out_buffer_size is not None:
-            # If write buffer is bounded, and we have more inflight requests than the configured
-            # write buffer size, then wait until the inflight requests arrive before continuing.
-            if self._out_inflight >= self._out_buffer_size:
+            # If write buffer is bounded, and the combined size of said buffer and all inflight
+            # requests is greater than the configured size, then wait until the combined size is
+            # less than the configured size.
+            if self._out_inflight + len(self._out_buffer) >= self._out_buffer_size:
                 self._out_stalls += 1
-            while self._out_inflight >= self._out_buffer_size:
+            while self._out_inflight + len(self._out_buffer) >= self._out_buffer_size:
                 self._logger.trace(f"OUT pipe {self._out_interface}: write pushback")
                 await self._out_tasks.wait_one()
 
@@ -450,6 +460,8 @@ class HardwareInOutPipe(HardwareInPipe, HardwareOutPipe, AbstractInOutPipe):
 class HardwareAssembly(AbstractAssembly):
     _HEALTH_ADDR   = 0x00
     _PIPE_RST_ADDR = 0x01
+    _ALERTS_ADDR   = 0x02
+    _1ST_USER_ADDR = _ALERTS_ADDR + 1
 
     @staticmethod
     def _create_platform(revision: str):
@@ -460,6 +472,8 @@ class HardwareAssembly(AbstractAssembly):
                 return GlasgowRevC0Platform()
             case "C1" | "C2" | "C3":
                 return GlasgowRevC123Platform()
+            case "D0":
+                return GlasgowRevD0Platform()
             case _:
                 assert False, f"invalid revision {revision}"
 
@@ -487,9 +501,11 @@ class HardwareAssembly(AbstractAssembly):
         self._in_streams    = [] # (domain, in_stream, in_flush, fifo_depth)
         self._out_streams   = [] # (domain, out_stream, fifo_depth)
         self._pipes         = [] # in_pipe|out_pipe|inout_pipe
+        self._memories      = [] # (domain, bus, DRAMOptions)
+        self._indicators    = [] # signal
         self._resets        = [] # (signal, when)
-        self._voltages      = {} # {port: vio}
-        self._pulls         = {} # {(port, number): state}
+        self._voltages      = [] # (port, vio)
+        self._pulls         = {} # (port, number): state
 
         self._logger        = logger
         self._applet        = None
@@ -507,11 +523,13 @@ class HardwareAssembly(AbstractAssembly):
         match self._revision:
             case "A0" | "B0":
                 return 1/36e6
-            case "C0" | "C1" | "C2" | "C3":
+            case "C0" | "C1" | "C2" | "C3" | "D0":
                 return 1/48e6
+            case _:
+                assert False, f"invalid revision {self._revision}"
 
     @contextmanager
-    def add_applet(self, applet: Any) -> Generator[None, None, None]:
+    def add_applet(self, applet: Any) -> Generator[None]:
         assert self._applet is None
 
         self._logger = applet.logger
@@ -525,19 +543,24 @@ class HardwareAssembly(AbstractAssembly):
             self._applet = None
             self._domain = None
 
+    @property
+    def _current_logger(self) -> logging.Logger:
+        assert self._logger is not None
+        return self._logger
+
     def add_platform_pin(self, pin: GlasgowPin, port_name: str) -> io.PortLike:
         assert self._artifact is None, "cannot add a port to a sealed assembly"
         # TODO: make this a proper error and not an assertion
         pin_name = f"{pin.port}{pin.number}"
         assert pin_name in self._platform.glasgow_pins, f"unknown or already used pin {pin_name}"
-        self._logger.debug("assigning pin %s to %s%s", port_name, pin_name,
+        self._current_logger.debug("assigning pin %s to %s%s", port_name, pin_name,
             " (inverted)" if pin.invert else "")
         if (pin.port, pin.number) not in self._pulls:
             self._pulls[pin.port, pin.number] = PullState.Float
         port = self._platform.glasgow_pins.pop(pin_name)
         return ~port if pin.invert else port
 
-    def add_submodule(self, elaboratable, *, name=None) -> Elaboratable:
+    def add_submodule[E: Elaboratable](self, elaboratable: E, *, name: str | None = None) -> E:
         assert self._artifact is None, "cannot add a submodule to a sealed assembly"
         self._modules.append((self._domain, elaboratable, name))
         elaboratable._MustUse__used = True
@@ -545,22 +568,24 @@ class HardwareAssembly(AbstractAssembly):
 
     def add_ro_register(self, signal) -> AbstractRORegister:
         assert self._artifact is None, "cannot add a register to a sealed assembly"
-        register = HardwareRORegister(self._logger, self,
-            address=2 + len(self._registers), shape=signal.shape(), name=signal.name)
+        register = HardwareRORegister(self._current_logger, self,
+            address=self._1ST_USER_ADDR + len(self._registers), shape=signal.shape(),
+            name=Value.cast(signal).name)
         self._registers.append((register, signal, self._domain))
         return register
 
     def add_rw_register(self, signal) -> AbstractRWRegister:
         assert self._artifact is None, "cannot add a register to a sealed assembly"
-        register = HardwareRWRegister(self._logger, self,
-            address=2 + len(self._registers), shape=signal.shape(), name=signal.name)
+        register = HardwareRWRegister(self._current_logger, self,
+            address=self._1ST_USER_ADDR + len(self._registers), shape=signal.shape(),
+            name=Value.cast(signal).name)
         self._registers.append((register, signal, self._domain))
         return register
 
     def add_in_pipe(self, in_stream, *, in_flush=C(0),
                     fifo_depth=None, buffer_size=None) -> AbstractInPipe:
         assert self._artifact is None, "cannot add a pipe to a sealed assembly"
-        in_pipe = HardwareInPipe(self._logger, self, buffer_size=buffer_size)
+        in_pipe = HardwareInPipe(self._current_logger, self, buffer_size=buffer_size)
         self._in_streams.append((self._domain, in_stream, in_flush, fifo_depth))
         self._pipes.append(in_pipe)
         return in_pipe
@@ -568,7 +593,7 @@ class HardwareAssembly(AbstractAssembly):
     def add_out_pipe(self, out_stream, *,
                      fifo_depth=None, buffer_size=None) -> AbstractOutPipe:
         assert self._artifact is None, "cannot add a pipe to a sealed assembly"
-        out_pipe = HardwareOutPipe(self._logger, self, buffer_size=buffer_size)
+        out_pipe = HardwareOutPipe(self._current_logger, self, buffer_size=buffer_size)
         self._out_streams.append((self._domain, out_stream, fifo_depth))
         self._pipes.append(out_pipe)
         return out_pipe
@@ -577,22 +602,41 @@ class HardwareAssembly(AbstractAssembly):
                        in_fifo_depth=None, in_buffer_size=None,
                        out_fifo_depth=None, out_buffer_size=None) -> AbstractInOutPipe:
         assert self._artifact is None, "cannot add a pipe to a sealed assembly"
-        inout_pipe = HardwareInOutPipe(self._logger, self,
+        inout_pipe = HardwareInOutPipe(self._current_logger, self,
             in_buffer_size=in_buffer_size, out_buffer_size=out_buffer_size)
         self._in_streams.append((self._domain, in_stream, in_flush, in_fifo_depth))
         self._out_streams.append((self._domain, out_stream, out_fifo_depth))
         self._pipes.append(inout_pipe)
         return inout_pipe
 
+    @override
+    def add_dynamic_memory(self, options=DRAMOptions()) -> tuple[octoram.Signature, range]:
+        if options.size is None:
+            options = dataclasses.replace(options, size=64 * 0x100000)
+        assert self._artifact is None, "cannot add a dynamic memory to a sealed assembly"
+        assert self._revision >= "C0", "DRAM is not available prior to revision D0"
+        assert len(self._memories) < 2, "only two memory channels are available"
+        assert options.size <= 64 * 0x100000, "memory size must be no more than 64 MB"
+        self._current_logger.debug(f"allocating DRAM channel {len(self._memories)}")
+        bus = octoram.Signature().flip().create()
+        self._memories.append((self._domain, bus, options))
+        # In the future we will likely allow sharing memories; for now this is not available so
+        # the entire chip is allocated to one applet.
+        return bus, range(options.size)
+
+    def add_indicator(self, signal: Signal, *, name: str):
+        self._current_logger.info("assigning indicator %r to U%d", name, len(self._indicators) + 1)
+        self._indicators.append(signal)
+
     def set_port_voltage(self, port: GlasgowPort, vio: GlasgowVio):
-        self._logger.debug("setting port %s voltage to %s V", port, vio)
-        self._voltages[port] = vio
+        self._current_logger.debug("setting port %s voltage to %s V", port, vio)
+        self._voltages.append((port, vio))
 
     def set_pin_pull(self, pin: GlasgowPin, state: PullState):
         if pin.invert:
             state = ~state
         if state.enabled():
-            self._logger.debug("pulling pin %s%s %s%s",
+            self._current_logger.debug("pulling pin %s%s %s%s",
                 pin.port, pin.number, state, " (was inverted)" if pin.invert else "")
         self._pulls[pin.port, pin.number] = state
 
@@ -608,6 +652,11 @@ class HardwareAssembly(AbstractAssembly):
             "flag": "-", "fd": "-"
         })
 
+        if self._revision >= "D0":
+            afe_mcu_pins = self._platform.request("afe_mcu", dir={"reset": "-"})
+            m.submodules.afe_mcu_reset = afe_mcu_reset = io.Buffer("o", afe_mcu_pins.reset)
+            m.d.comb += afe_mcu_reset.oe.eq(0)
+
         m.submodules.i2c_target = i2c_target = I2CTarget(i2c_pins)
         m.submodules.i2c_registers = i2c_registers = I2CRegisters(i2c_target)
         m.d.comb += i2c_target.address.eq(0b0001000)
@@ -621,10 +670,23 @@ class HardwareAssembly(AbstractAssembly):
         pipe_rst, pipe_rst_addr = i2c_registers.add_rw(4, init=0b1111)
         assert pipe_rst_addr == self._PIPE_RST_ADDR
 
+        # always add an alert (essentially, interrupt) register at address 0x02
+        alerts, alerts_addr = i2c_registers.add_ro(8)
+        assert alerts_addr == self._ALERTS_ADDR
+
+        try:
+            # Available on revC0+ only.
+            alert_pin = self._platform.request("alert", dir="-")
+            m.submodules.i2c_alert = i2c_alert = io.Buffer("o", alert_pin)
+            m.d.comb += i2c_alert.o.eq(1)
+            m.d.comb += i2c_alert.oe.eq(alerts.any())
+        except ResourceError:
+            pass
+
         for domain in self._domains:
             m.domains += domain
             m.d.comb += domain.clk.eq(ClockSignal())
-            with m.If(ResetSignal()):
+            with m.If(ResetSignal(allow_reset_less=True)):
                 m.d.comb += domain.rst.eq(1)
             # Applet domain reset is also asserted below, whenever any of the pipes associated with
             # the applet is held in reset.
@@ -641,6 +703,74 @@ class HardwareAssembly(AbstractAssembly):
             elif isinstance(register, HardwareRORegister):
                 register_addr = i2c_registers.add_existing_ro(Value.cast(signal))
             assert register_addr == register._address
+
+        if self._memories and "D0" <= self.revision < "E0":
+            # The location constraint should not be needed with new enough nextpnr-ecp5, but is
+            # included here as insurance. TODO: remove this once nextpnr-0.11 is used.
+            plan = pll.ClockPlan(self.sys_clk_period, location="X70/Y49/EHXPLL_LR")
+            m.domains.dram_edge = plan.add_domain(
+                pll.ecp5.Channel(period=1/(2*112e6), usage="edge"))
+            m.submodules.dram_pll = plan.create(self._platform)
+
+            # See the comment in `octoram.Controller` about ECP5.
+            m.domains.dram_sync = ClockDomain(local=True)
+            m.submodules.logic_rst = cdc.ResetSynchronizer(ResetSignal(domain.name),
+                domain="dram_sync")
+            m.submodules.logic_div = Instance("CLKDIVF",
+                i_RST=ResetSignal("dram_edge"),
+                i_CLKI=ClockSignal("dram_edge"),
+                o_CDIVX=ClockSignal("dram_sync"),
+            )
+
+            for channel, (domain, mem_bus, options) in enumerate(self._memories):
+                mem_ports = self._platform.request("octoram", channel,
+                    dir={"cs": "-", "clk": "-", "dq": "-", "dqs": "-"})
+                m.submodules[f"mem_ctrl{channel}"] = mem_ctrl = DomainRenamer({
+                    "sync": "dram_sync", "edge": "dram_edge",
+                })(octoram.Controller(mem_ports, half_rate=False))
+                m.d.comb += mem_ctrl.mem_type.eq(octoram.MemoryType.OctalSPI)
+                m.d.comb += mem_ctrl.latency.eq(5)
+                m.submodules[f"mem_queue{channel}"] = mem_queue = octoram.InterfaceQueue(
+                    i_domain=domain.name,
+                    o_domain="dram_sync",
+                    w_buffer_depth=options.w_buffer_size,
+                    r_buffer_depth=options.r_buffer_size,
+                )
+                wiring.connect(m, mem_queue.o, mem_ctrl.bus)
+                wiring.connect(m, wiring.flipped(mem_bus), mem_queue.i)
+
+        elif self._memories and "C0" <= self.revision < "D0":
+            if os.getenv("GLASGOW_REVC_DRAM", "no") == "yes":
+                logger.warning("DRAM support on revC is experimental, use at your own risk")
+            else:
+                logger.error("DRAM support on revC is not enabled without GLASGOW_REVC_DRAM=yes")
+                os._exit(1)
+
+            self._platform.add_ram_pak_resources()
+
+            plan = pll.ClockPlan(self.sys_clk_period)
+            m.domains.dram_sync = plan.add_domain(pll.Channel(period=1/(64e6)))
+            m.submodules.dram_pll = plan.create(self._platform)
+
+            for channel, (domain, mem_bus, options) in enumerate(self._memories):
+                mem_ports = self._platform.request("octoram", channel,
+                    dir={"cs": "-", "clk": "-", "dq": "-", "dqs": "-"})
+                m.submodules[f"mem_ctrl{channel}"] = mem_ctrl = DomainRenamer({
+                    "sync": "dram_sync",
+                })(octoram.Controller(mem_ports, half_rate=True))
+                m.d.comb += mem_ctrl.mem_type.eq(octoram.MemoryType.HyperRAM)
+                m.d.comb += mem_ctrl.latency.eq(7)
+                m.submodules[f"mem_queue{channel}"] = mem_queue = octoram.InterfaceQueue(
+                    i_domain=domain.name,
+                    o_domain="dram_sync",
+                    w_buffer_depth=options.w_buffer_size,
+                    r_buffer_depth=options.r_buffer_size,
+                )
+                wiring.connect(m, mem_queue.o, mem_ctrl.bus)
+                wiring.connect(m, wiring.flipped(mem_bus), mem_queue.i)
+
+        elif self._memories:
+            assert False, "DRAM not available on this hardware revision"
 
         m.submodules.fx2_crossbar = fx2_crossbar = FX2Crossbar(fx2_pins)
 
@@ -673,6 +803,15 @@ class HardwareAssembly(AbstractAssembly):
                 with m.If(out_ep.reset):
                     m.d.comb += domain.rst.eq(1)
 
+        for index, led_value in enumerate(self._indicators):
+            try:
+                led_port = self._platform.request("led", index, dir="-")
+                m.submodules[f"led{index}"] = led_buffer = io.Buffer("o", led_port)
+                m.d.comb += led_buffer.o.eq(led_value)
+            except ResourceError:
+                logger.error("ran out of LEDs to use for indicator display")
+                break
+
         # /!\ IMPORTANT /!\
         # tie off output enables of unused pins to zero, or they will strongly drive high
         for idx, unused_pins in enumerate(self._platform.glasgow_pins.values()):
@@ -685,7 +824,19 @@ class HardwareAssembly(AbstractAssembly):
         except ResourceError:
             pass
 
-        self._artifact = GlasgowBuildPlan(self._platform.prepare(m,
+        toolchain = find_toolchain(tools=self._platform.required_tools)
+        # nextpnr-ecp5 *must* include commit `7c667eeba362a8538396f9c4dc9bd1a168b35fa3`, or any
+        # applet that uses IO gearboxes will be broken due to PLL placement issues.
+        toolchain.assert_version("nextpnr-ecp5", ("0", "10", "88"))
+
+        match self._platform:
+            case SiliconBluePlatform():
+                # TODO: https://github.com/GlasgowEmbedded/glasgow/issues/1203
+                nextpnr_opts = "--placer heap --no-promote-globals"
+            case _:
+                nextpnr_opts = "--placer heap"
+
+        build_plan = self._platform.prepare(m,
             # always emit complete build log to stdout; whether it's displayed is controlled by
             # the usual logging options, e.g. `-vv` or `-v -F build`
             verbose=True,
@@ -695,24 +846,29 @@ class HardwareAssembly(AbstractAssembly):
             # latest yosys and nextpnr versions default to this configuration, but we support some
             # older ones in case yowasp isn't available and this keeps the configuration consistent
             synth_opts="-abc9",
-            nextpnr_opts="--placer heap",
-        ), find_toolchain())
+            nextpnr_opts=nextpnr_opts,
+        )
+        product_name = self._platform.bitstream_filename("top")
+        self._artifact = GlasgowBuildPlan(build_plan, toolchain, product_name)
         return self._artifact
 
     @property
-    def device(self):
+    def device(self) -> GlasgowDevice:
         if not self._running:
             raise RuntimeError("runtime features may be used only while a bitstream is loaded")
+        assert self._device is not None
         return self._device
 
     async def configure_ports(self):
-        for port, vio in self._voltages.items():
+        for port, vio in self._voltages:
             if vio.sense is not None:
-                sensed = await self.device.mirror_voltage(port, str(vio.sense))
+                assert port != GlasgowPort.ALL
+                sensed = await self.device.mirror_voltage(str(port), str(vio.sense))
                 logger.info(
                     "port %s voltage set to %.1f V (sensed on port %s)", port, sensed, vio.sense)
             if vio.value is not None:
-                await self.device.set_voltage(port, vio.value)
+                spec = self.device.all_ports if port == GlasgowPort.ALL else str(port)
+                await self.device.set_voltage(spec, vio.value)
                 logger.info("port %s voltage set to %.1f V", port, vio.value)
 
         port_pulls = defaultdict(lambda: (set(), set()))
@@ -722,10 +878,15 @@ class HardwareAssembly(AbstractAssembly):
                 case PullState.Low:  low .add(number)
                 case PullState.High: high.add(number)
         for port, (low, high) in port_pulls.items():
-            voltage = await self.device.get_voltage(str(port))
-            if voltage == 0.0:
-                logger.error("cannot configure pulls for port %s: Vio is off", port)
+            if not low and not high:
                 continue
+            if self._revision < "D0":
+                # revC powers the level shifters from Vio; revD uses a special clamping circuit
+                # to avoid having them fall off the bus when Vio is off.
+                voltage = await self.device.get_voltage(str(port))
+                if voltage == 0.0:
+                    logger.error("cannot configure pulls for port %s: Vio is off", port)
+                    continue
             await self.device.set_pulls(str(port), low, high)
 
     @property
@@ -748,35 +909,19 @@ class HardwareAssembly(AbstractAssembly):
             raise RuntimeError("no device provided")
 
         await self._device.open()
-
-        # Load the bitstream first, since the FX2 needs to be able to access PIPE_RST register.
         if _bitstream_file is not None:
             await self._device.download_prebuilt(self.artifact(), _bitstream_file)
         else:
-            await self._device.download_target(self.artifact(), reload=reload_bitstream)
+            await self._device.download_plan(self.artifact(), reload=reload_bitstream)
 
-        if len(self._in_streams) <= 1 and len(self._out_streams) <= 1:
-            # Neither WinUSB, nor libusbK, nor libusb0 allow selecting any configuration other
-            # than the 1st one. This is a limitation of the KMDF USB target. In this case we
-            # fall back to using the configuration with fewer FX2-side buffers.
-            try:
-                await self._device.usb_device.select_configuration(2)
-            # `ErrorNotSupported` with libusb backend, `ErrorStall` with webusb backend.
-            except (usb.ErrorNotSupported, usb.ErrorStall):
-                await self._device.usb_device.select_configuration(1)
-        elif len(self._in_streams) <= 2 and len(self._out_streams) <= 2:
-            await self._device.usb_device.select_configuration(1)
-        else:
-            assert False, "too many pipes"
-
-        interfaces = self._device.usb_device.configuration.interfaces
+        interfaces = self._device.usb_device.configuration.interfaces[1:]
 
         in_ifaces = interfaces[len(interfaces) // 2:]
         in_pipes = iter(pipe for pipe in self._pipes if isinstance(pipe, HardwareInPipe))
         for in_iface, in_pipe in zip(in_ifaces, in_pipes):
             in_pipe._in_interface = in_iface.number
-            _disabled_setting, enabled_setting = in_iface.alternates
-            endpoint, = enabled_setting.endpoints
+            in_pipe._in_alt_setting = 2 if len(self._in_streams) <= 1 else 1
+            endpoint, = in_iface.alternates[in_pipe._in_alt_setting].endpoints
             in_pipe._in_ep_address = endpoint.number
             in_pipe._in_packet_size = endpoint.packet_size
 
@@ -784,8 +929,8 @@ class HardwareAssembly(AbstractAssembly):
         out_pipes = iter(pipe for pipe in self._pipes if isinstance(pipe, HardwareOutPipe))
         for out_iface, out_pipe in zip(out_ifaces, out_pipes):
             out_pipe._out_interface = out_iface.number
-            _disabled_setting, enabled_setting = out_iface.alternates
-            endpoint, = enabled_setting.endpoints
+            out_pipe._out_alt_setting = 2 if len(self._out_streams) <= 1 else 1
+            endpoint, = out_iface.alternates[out_pipe._out_alt_setting].endpoints
             out_pipe._out_ep_address = endpoint.number
             out_pipe._out_packet_size = endpoint.packet_size
 
@@ -814,7 +959,7 @@ class HardwareAssembly(AbstractAssembly):
         for pipe in self._pipes:
             await pipe._stop()
 
-        await self._device.close()
+        await self.device.close()
 
         self._running = False
 

@@ -5,12 +5,11 @@
 # This applet incorporates by reference the protocol used by the `swd-probe` applet. Breaking
 # changes to the protocol of that applet are also breaking changes to the protocol of this applet.
 
-import logging
-
 from amaranth import *
 from amaranth.lib import enum, wiring, stream, io
 from amaranth.lib.wiring import In, Out
 
+from glasgow.support import logging
 from glasgow.gateware import cobs
 from glasgow.gateware.stream import StreamBuffer
 from glasgow.hardware.device import VID_QIHW, PID_GLASGOW
@@ -221,8 +220,8 @@ class ProbeRsApplet(GlasgowAppletV2):
     Expose SWD via a socket that can be used with `probe-rs <https://probe.rs>`_. JTAG debugging
     is not supported (yet).
 
-    This applet is experimental. Currently, to use it you must build probe-rs from git. The current
-    protocol version is ``{ProbeRsRootTarget.IDENTIFIER.decode("ascii")}``.
+    The current protocol version is ``{ProbeRsRootTarget.IDENTIFIER.decode("ascii")}``, which is
+    available in probe-rs 0.30.0 or later.
     """
     required_revision = "C0"
 

@@ -1,10 +1,11 @@
 import sys
-import logging
 import argparse
+
 from amaranth import *
 from amaranth.lib import data, wiring, stream, io, cdc
 from amaranth.lib.wiring import Out
 
+from glasgow.support import logging
 from glasgow.support.logging import dump_hex
 from glasgow.gateware.stream import AsyncQueue
 from glasgow.gateware import cobs
@@ -64,8 +65,7 @@ class QSPIAnalyzerFrontend(wiring.Component):
         m.domains.fifo = cd_fifo = ClockDomain(reset_less=True, local=True)
         m.d.comb += cd_fifo.clk.eq(sck_buffer.i)
 
-        m.submodules.fifo = fifo = AsyncQueue(
-            shape=self.stream.p.shape(),
+        m.submodules.fifo = fifo = AsyncQueue.shaped_like(self.stream,
             depth=4, # CDC only, no buffering
             i_domain="fifo",
             o_domain="sync"
@@ -224,7 +224,7 @@ class QSPIAnalyzerApplet(GlasgowAppletV2):
     * ``<DATA>``, where <DATA> is a hexadecimal nibble sequence with each four bits corresponding
       to samples of HOLD#, WP#, CIPO, COPI (from MSB to LSB).
 
-    If your DUT is a 25-series SPI Flash memory, use the `tool memory-25x` to extract data
+    If your DUT is a 25-series SPI Flash memory, use the `tool memory-25q` to extract data
     from capture files. If quad-IO commands are not in use, the `spi-analyzer` applet can
     reduce the likelihood of an overflow.
     """
